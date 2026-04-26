@@ -1687,7 +1687,894 @@ app.listen(3000);
 
 `AsyncLocalStorage` 为 Koa 开发者提供了一种优雅的方式来处理请求上下文，特别是在复杂的多层级应用中。它解决了传统参数透传的痛点，同时避免了全局变量的竞态条件问题，是现代 Node.js Web 开发中的一个重要工具。
 
-## 11. 参考资料
+## 11. 响应处理机制深度分析
+
+在 Koa 中，中间件执行完成后，响应最终是通过 `lib/application.js` 中的 `respond(ctx)` 函数写回给客户端的。这个函数负责处理不同类型的响应体（string、Buffer、Stream、JSON 对象），以及特殊的请求类型（如 HEAD 请求）。
+
+### 11.1 respond 函数的核心实现
+
+#### 11.1.1 完整源码分析
+
+在 `lib/application.js` 中，`respond` 函数的实现如下：
+
+```javascript
+function respond (ctx) {
+  // 1. 允许绕过 Koa 的响应处理
+  if (ctx.respond === false) return
+
+  const res = ctx.res
+
+  // 2. 检查响应是否可写
+  if (!ctx.writable) return res.end()
+
+  let body = ctx.body
+  const code = ctx.status
+
+  // 3. 处理空状态码（不需要 body）
+  if (statuses.empty[code]) {
+    // 清除响应头
+    ctx.body = null
+    return res.end()
+  }
+
+  // 4. 处理 HEAD 请求
+  if (ctx.method === 'HEAD') {
+    if (!res.headersSent && !ctx.response.has('Content-Length')) {
+      const { length } = ctx.response
+      if (Number.isInteger(length)) ctx.length = length
+    }
+    return res.end()
+  }
+
+  // 5. 处理 null 或 undefined 的 body
+  if (body === null || body === undefined) {
+    if (ctx.response._explicitNullBody) {
+      ctx.response.remove('Content-Type')
+      ctx.response.remove('Transfer-Encoding')
+      ctx.length = 0
+      return res.end()
+    }
+    if (ctx.req.httpVersionMajor >= 2) {
+      body = String(code)
+    } else {
+      body = ctx.message || String(code)
+    }
+    if (!res.headersSent) {
+      ctx.type = 'text'
+      ctx.length = Buffer.byteLength(body)
+    }
+    return res.end(body)
+  }
+
+  // 6. 处理不同类型的 body
+
+  // 6.1 Buffer 类型
+  if (Buffer.isBuffer(body)) return res.end(body)
+  
+  // 6.2 string 类型
+  if (typeof body === 'string') return res.end(body)
+
+  // 6.3 Stream 类型（包括 Blob、ReadableStream、Response、普通 Stream）
+  let stream = null
+  if (body instanceof Blob) stream = Stream.Readable.from(body.stream())
+  else if (body instanceof ReadableStream) stream = Stream.Readable.from(body)
+  else if (body instanceof Response) stream = Stream.Readable.from(body?.body || '')
+  else if (isStream(body)) stream = body
+
+  if (stream) {
+    return Stream.pipeline(stream, res, err => {
+      if (err && ctx.app.listenerCount('error')) ctx.onerror(err)
+    })
+  }
+
+  // 6.4 JSON 对象类型（默认情况）
+  body = JSON.stringify(body)
+  if (!res.headersSent) {
+    ctx.length = Buffer.byteLength(body)
+  }
+  res.end(body)
+}
+```
+
+#### 11.1.2 辅助函数
+
+**isStream 函数**（位于 `lib/is-stream.js`）：
+
+```javascript
+const Stream = require('stream')
+
+module.exports = (stream) => {
+  return (
+    stream instanceof Stream ||
+    (stream !== null &&
+      typeof stream === 'object' &&
+      !!stream.readable &&
+      typeof stream.pipe === 'function' &&
+      typeof stream.read === 'function' &&
+      typeof stream.readable === 'boolean' &&
+      typeof stream.readableObjectMode === 'boolean' &&
+      typeof stream.destroy === 'function' &&
+      typeof stream.destroyed === 'boolean')
+  )
+}
+```
+
+**statuses.empty**：
+- 这是 `statuses` 库提供的一个对象，包含了所有不需要响应体的 HTTP 状态码
+- 例如：204（No Content）、304（Not Modified）等
+
+### 11.2 响应处理的完整流程
+
+让我们详细分析 `respond` 函数的执行流程：
+
+#### 11.2.1 预处理阶段
+
+**1. 绕过 Koa 响应处理**：
+
+```javascript
+if (ctx.respond === false) return
+```
+
+- 如果 `ctx.respond` 设置为 `false`，Koa 不会处理响应
+- 这允许开发者完全控制响应的发送
+- 适用于需要自定义响应处理的场景
+
+**2. 检查响应可写性**：
+
+```javascript
+if (!ctx.writable) return res.end()
+```
+
+- 检查响应是否可写
+- 如果不可写，直接结束响应
+- 这可以防止在响应已发送后尝试写入数据
+
+**3. 获取响应数据**：
+
+```javascript
+let body = ctx.body
+const code = ctx.status
+```
+
+- 从上下文对象中获取响应体和状态码
+- `ctx.body` 是中间件设置的响应内容
+- `ctx.status` 是 HTTP 状态码
+
+#### 11.2.2 特殊状态码处理
+
+**处理空状态码**：
+
+```javascript
+if (statuses.empty[code]) {
+  ctx.body = null
+  return res.end()
+}
+```
+
+**什么是空状态码**：
+- 某些 HTTP 状态码不需要响应体
+- 例如：
+  - 204（No Content）：请求成功，但没有响应体
+  - 304（Not Modified）：资源未修改，使用缓存
+  - 205（Reset Content）：重置内容
+  - 1xx 信息性状态码
+
+**处理逻辑**：
+1. 检查状态码是否在 `statuses.empty` 中
+2. 如果是，清除 `ctx.body`
+3. 直接结束响应，不发送任何内容
+
+#### 11.2.3 HEAD 请求处理
+
+**HEAD 请求的特殊性**：
+- HEAD 请求与 GET 请求类似，但服务器只返回响应头，不返回响应体
+- 客户端可以通过 HEAD 请求检查资源的元数据（如 Content-Length、Last-Modified 等）
+
+**Koa 中的处理**：
+
+```javascript
+if (ctx.method === 'HEAD') {
+  if (!res.headersSent && !ctx.response.has('Content-Length')) {
+    const { length } = ctx.response
+    if (Number.isInteger(length)) ctx.length = length
+  }
+  return res.end()
+}
+```
+
+**处理逻辑**：
+
+1. **检查请求方法**：如果是 HEAD 请求，进入特殊处理流程
+
+2. **设置 Content-Length 头**：
+   - 检查响应头是否已发送
+   - 检查是否已经设置了 Content-Length
+   - 如果没有设置，尝试从 `ctx.response.length` 获取
+   - 如果 `length` 是整数，设置 `ctx.length`
+   - 这样客户端可以知道如果发送 GET 请求，响应体的大小
+
+3. **结束响应**：
+   - 调用 `res.end()` 结束响应
+   - **注意**：不发送响应体，只发送响应头
+
+**为什么这样处理**：
+- HEAD 请求的目的是获取资源的元数据
+- 客户端不需要实际的响应体
+- 但需要知道响应体的大小（Content-Length）
+- 这样客户端可以决定是否需要发送 GET 请求获取实际内容
+
+#### 11.2.4 Null/Undefined Body 处理
+
+**情况分析**：
+
+当 `ctx.body` 为 `null` 或 `undefined` 时，Koa 有几种处理方式：
+
+**1. 显式 Null Body**：
+
+```javascript
+if (ctx.response._explicitNullBody) {
+  ctx.response.remove('Content-Type')
+  ctx.response.remove('Transfer-Encoding')
+  ctx.length = 0
+  return res.end()
+}
+```
+
+- 如果 `ctx.response._explicitNullBody` 为 `true`
+- 表示开发者明确希望发送空响应体
+- 处理方式：
+  - 移除 Content-Type 头
+  - 移除 Transfer-Encoding 头
+  - 设置 Content-Length 为 0
+  - 结束响应
+
+**2. 自动生成响应体**：
+
+```javascript
+if (ctx.req.httpVersionMajor >= 2) {
+  body = String(code)
+} else {
+  body = ctx.message || String(code)
+}
+if (!res.headersSent) {
+  ctx.type = 'text'
+  ctx.length = Buffer.byteLength(body)
+}
+return res.end(body)
+```
+
+**HTTP/2 处理**：
+- 如果 HTTP 版本 >= 2
+- 响应体只包含状态码字符串（如 "404"）
+- HTTP/2 协议对响应体有更严格的要求
+
+**HTTP/1.x 处理**：
+- 如果 HTTP 版本 < 2
+- 响应体包含状态消息（如 "Not Found"）或状态码字符串
+- `ctx.message` 是开发者设置的状态消息
+- 如果没有设置，使用状态码字符串
+
+**响应头设置**：
+- 如果响应头还没发送
+- 设置 Content-Type 为 "text/plain"
+- 设置 Content-Length 为响应体的字节长度
+
+**发送响应**：
+- 调用 `res.end(body)` 发送响应体
+
+#### 11.2.5 不同 Body 类型的处理路径
+
+这是 `respond` 函数的核心部分，处理不同类型的响应体。
+
+**处理顺序**：
+1. Buffer 类型
+2. string 类型
+3. Stream 类型（包括 Blob、ReadableStream、Response、普通 Stream）
+4. JSON 对象类型（默认情况）
+
+**为什么是这个顺序**：
+- Buffer 和 string 是最简单的类型，直接发送
+- Stream 类型需要特殊处理（流式传输）
+- JSON 对象是默认情况，需要序列化
+
+让我们详细分析每种类型的处理：
+
+**1. Buffer 类型处理**：
+
+```javascript
+if (Buffer.isBuffer(body)) return res.end(body)
+```
+
+**处理逻辑**：
+- 检查 `body` 是否是 Buffer 类型
+- 如果是，直接调用 `res.end(body)` 发送
+- Buffer 是 Node.js 中处理二进制数据的标准方式
+
+**适用场景**：
+- 图片、视频等二进制文件
+- 预生成的二进制数据
+- 从文件系统读取的原始数据
+
+**示例**：
+
+```javascript
+const fs = require('fs')
+
+app.use(async (ctx) => {
+  // 读取图片文件为 Buffer
+  const imageBuffer = fs.readFileSync('image.jpg')
+  
+  // 设置响应体为 Buffer
+  ctx.body = imageBuffer
+  ctx.type = 'image/jpeg'
+})
+```
+
+**2. String 类型处理**：
+
+```javascript
+if (typeof body === 'string') return res.end(body)
+```
+
+**处理逻辑**：
+- 检查 `body` 是否是 string 类型
+- 如果是，直接调用 `res.end(body)` 发送
+- string 是最常见的文本响应类型
+
+**适用场景**：
+- HTML 页面
+- 纯文本响应
+- XML 数据
+- 简单的 JSON 字符串（但推荐使用 JSON 对象）
+
+**示例**：
+
+```javascript
+app.use(async (ctx) => {
+  // 设置响应体为字符串
+  ctx.body = '<html><body>Hello Koa!</body></html>'
+  ctx.type = 'text/html'
+})
+```
+
+**3. Stream 类型处理**：
+
+这是最复杂的处理逻辑，支持多种 Stream 类型：
+
+```javascript
+let stream = null
+if (body instanceof Blob) stream = Stream.Readable.from(body.stream())
+else if (body instanceof ReadableStream) stream = Stream.Readable.from(body)
+else if (body instanceof Response) stream = Stream.Readable.from(body?.body || '')
+else if (isStream(body)) stream = body
+
+if (stream) {
+  return Stream.pipeline(stream, res, err => {
+    if (err && ctx.app.listenerCount('error')) ctx.onerror(err)
+  })
+}
+```
+
+**支持的 Stream 类型**：
+
+**3.1 Blob 类型**：
+- Blob 是浏览器端的二进制数据类型
+- Node.js 也支持 Blob（从 v15.7.0 开始）
+- 使用 `body.stream()` 获取可读流
+- 使用 `Stream.Readable.from()` 转换为 Node.js 可读流
+
+**3.2 ReadableStream 类型**：
+- ReadableStream 是 Web Streams API 的标准
+- 直接使用 `Stream.Readable.from()` 转换
+
+**3.3 Response 类型**：
+- Response 是 Fetch API 的响应对象
+- 从 `body?.body` 获取可读流（注意：这里有两个 `body`，第一个是 Response 对象，第二个是 Response 的 body 属性）
+- 使用 `Stream.Readable.from()` 转换
+
+**3.4 普通 Stream 类型**：
+- 使用 `isStream()` 函数检查
+- 检查是否是 `Stream` 实例，或者具有 Stream 特征的对象
+
+**Stream 处理逻辑**：
+
+```javascript
+if (stream) {
+  return Stream.pipeline(stream, res, err => {
+    if (err && ctx.app.listenerCount('error')) ctx.onerror(err)
+  })
+}
+```
+
+**关键点**：
+
+1. **使用 Stream.pipeline**：
+   - `Stream.pipeline` 是 Node.js 推荐的流式数据处理方式
+   - 它会自动管理流的生命周期
+   - 如果发生错误，会自动销毁所有流
+   - 比手动使用 `pipe()` 更安全
+
+2. **错误处理**：
+   - 回调函数接收错误参数
+   - 检查是否有错误
+   - 检查应用是否监听了 'error' 事件
+   - 如果是，调用 `ctx.onerror(err)` 处理错误
+
+**为什么使用 Stream.pipeline**：
+
+传统的 `pipe()` 方法有一些问题：
+- 如果目标流关闭或报错，源流不会自动销毁
+- 可能导致内存泄漏
+- 错误处理复杂
+
+`Stream.pipeline` 解决了这些问题：
+- 自动管理所有流的生命周期
+- 如果任何一个流报错，所有流都会被销毁
+- 提供统一的错误处理回调
+
+**Stream 类型的适用场景**：
+
+1. **大文件下载**：
+   - 不需要将整个文件加载到内存
+   - 可以边读取边发送
+   - 节省内存，提高性能
+
+   ```javascript
+   const fs = require('fs')
+
+   app.use(async (ctx) => {
+     // 创建文件可读流
+     const readStream = fs.createReadStream('large-file.zip')
+     
+     // 设置响应体为 Stream
+     ctx.body = readStream
+     ctx.type = 'application/zip'
+     ctx.attachment('large-file.zip')
+   })
+   ```
+
+2. **实时数据推送**：
+   - 服务器发送事件（SSE）
+   - WebSocket 数据
+   - 实时日志流
+
+3. **代理请求**：
+   - 将后端服务的响应流式转发给客户端
+   - 不需要等待完整响应
+   - 减少延迟和内存使用
+
+**4. JSON 对象类型处理（默认情况）**：
+
+如果 `body` 不是以上任何类型，Koa 会将其视为 JSON 对象：
+
+```javascript
+body = JSON.stringify(body)
+if (!res.headersSent) {
+  ctx.length = Buffer.byteLength(body)
+}
+res.end(body)
+```
+
+**处理逻辑**：
+
+1. **JSON 序列化**：
+   - 使用 `JSON.stringify(body)` 将对象序列化为 JSON 字符串
+   - 这是 Koa 最常用的响应类型
+   - 适用于 API 响应
+
+2. **设置 Content-Length**：
+   - 如果响应头还没发送
+   - 计算序列化后的 JSON 字符串的字节长度
+   - 设置 `ctx.length`
+   - 这样客户端可以知道响应体的大小
+
+3. **发送响应**：
+   - 调用 `res.end(body)` 发送序列化后的 JSON 字符串
+
+**适用场景**：
+- RESTful API 响应
+- AJAX 请求响应
+- 任何需要返回结构化数据的场景
+
+**示例**：
+
+```javascript
+app.use(async (ctx) => {
+  // 设置响应体为 JSON 对象
+  ctx.body = {
+    success: true,
+    data: {
+      id: 123,
+      name: 'John Doe',
+      email: 'john@example.com'
+    },
+    timestamp: Date.now()
+  }
+  // Koa 会自动设置 Content-Type 为 application/json
+})
+```
+
+**自动设置 Content-Type**：
+
+值得注意的是，当 `ctx.body` 是对象时，Koa 会自动设置 `Content-Type` 为 `application/json`。这是在 `response.js` 中处理的：
+
+```javascript
+// 伪代码，实际在 response.js 中
+set body(val) {
+  // ...
+  if (val !== null) {
+    // 自动检测 Content-Type
+    if (!this.has('Content-Type')) {
+      if (typeof val === 'string') {
+        this.type = /^\s*</.test(val) ? 'html' : 'text'
+      } else if (Buffer.isBuffer(val)) {
+        this.type = 'bin'
+      } else if (typeof val === 'object' && val !== null) {
+        this.type = 'json'
+      }
+    }
+  }
+  // ...
+}
+```
+
+这就是为什么我们不需要手动设置 `Content-Type` 为 `application/json`，Koa 会自动处理。
+
+### 11.3 响应处理流程总结
+
+让我们通过一个流程图来总结 `respond` 函数的完整执行流程：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      respond(ctx) 开始                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              ctx.respond === false ?                         │
+└─────────────────────────────────────────────────────────────┘
+          │                         │
+          │ Yes                     │ No
+          ▼                         ▼
+┌─────────────────┐    ┌─────────────────────────────────────┐
+│    直接返回      │    │         ctx.writable ?              │
+│  (绕过 Koa 处理) │    └─────────────────────────────────────┘
+└─────────────────┘              │
+                                 │                         │
+                                 │ No                      │ Yes
+                                 ▼                         ▼
+                        ┌─────────────────┐    ┌─────────────────────────────┐
+                        │  res.end()      │    │  获取 body = ctx.body       │
+                        │  (结束响应)      │    │  获取 code = ctx.status     │
+                        └─────────────────┘    └─────────────────────────────┘
+                                                          │
+                                                          ▼
+                                               ┌─────────────────────────────┐
+                                               │   statuses.empty[code] ?    │
+                                               └─────────────────────────────┘
+                                                          │
+                                        │                                 │
+                                        │ Yes                             │ No
+                                        ▼                                 ▼
+                              ┌─────────────────┐          ┌─────────────────────────────┐
+                              │ ctx.body = null │          │      ctx.method === 'HEAD'? │
+                              │   res.end()     │          └─────────────────────────────┘
+                              │  (结束响应)      │                    │
+                              └─────────────────┘          │                    │
+                                                           │ Yes                │ No
+                                                           ▼                    ▼
+                                                ┌─────────────────┐   ┌─────────────────────────────┐
+                                                │ 设置 Content-   │   │  body === null 或 undefined? │
+                                                │ Length 头       │   └─────────────────────────────┘
+                                                │   res.end()     │              │
+                                                │  (结束响应)      │   │                    │
+                                                └─────────────────┘   │ Yes                │ No
+                                                                       ▼                    ▼
+                                                            ┌─────────────────┐   ┌─────────────────────────────┐
+                                                            │ 处理 Null Body  │   │  检查 body 类型:            │
+                                                            │  (自动生成或空)  │   │  - Buffer?                  │
+                                                            └─────────────────┘   │  - string?                  │
+                                                                                  │  - Stream?                  │
+                                                                                  │  - JSON 对象?               │
+                                                                                  └─────────────────────────────┘
+                                                                                              │
+                                    ┌───────────────────┬───────────────────┬───────────────────┐
+                                    ▼                   ▼                   ▼                   ▼
+                          ┌───────────────┐   ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+                          │   Buffer      │   │    string     │   │    Stream     │   │  JSON 对象    │
+                          │  直接发送      │   │   直接发送     │   │  流式传输     │   │  序列化后发送  │
+                          │ res.end(body) │   │ res.end(body) │   │ pipeline()    │   │ JSON.stringify│
+                          └───────────────┘   └───────────────┘   └───────────────┘   └───────────────┘
+```
+
+### 11.4 不同 Body 类型的对比
+
+让我们通过一个表格来对比不同 body 类型的特点：
+
+| 特性 | Buffer | String | Stream | JSON 对象 |
+|------|--------|--------|--------|-----------|
+| **内存占用** | 高（全部加载到内存） | 高（全部加载到内存） | 低（流式传输） | 高（序列化后加载到内存） |
+| **适用场景** | 二进制文件、图片 | HTML、文本、XML | 大文件、实时数据 | API 响应、结构化数据 |
+| **处理复杂度** | 简单 | 简单 | 复杂（需要错误处理） | 简单（自动序列化） |
+| **性能** | 好（小文件） | 好（小响应） | 好（大文件） | 好（小对象） |
+| **Content-Type** | 需要手动设置 | 自动检测（html/text） | 需要手动设置 | 自动设置为 application/json |
+| **流式支持** | 否 | 否 | 是 | 否 |
+
+### 11.5 最佳实践
+
+#### 11.5.1 选择合适的 Body 类型
+
+**1. 小文件或二进制数据（< 1MB）**：
+- 使用 Buffer 类型
+- 简单直接，性能好
+- 示例：图片、图标、小文档
+
+**2. 文本数据**：
+- 使用 string 类型
+- 简单直接
+- 示例：HTML 页面、纯文本、XML
+
+**3. 大文件或实时数据**：
+- 使用 Stream 类型
+- 节省内存，支持大文件
+- 示例：视频下载、大文件、实时日志
+
+**4. 结构化数据**：
+- 使用 JSON 对象类型
+- Koa 自动序列化
+- 示例：API 响应、配置数据
+
+#### 11.5.2 Stream 类型的最佳实践
+
+**1. 使用 Stream.pipeline**：
+- 不要使用 `pipe()` 方法
+- `Stream.pipeline` 更安全，自动管理流生命周期
+- 提供统一的错误处理
+
+**2. 错误处理**：
+- 总是处理 Stream 错误
+- Koa 会通过 `ctx.onerror` 处理未捕获的错误
+- 但最好在业务逻辑中也处理错误
+
+**3. 内存管理**：
+- Stream 会自动管理内存
+- 不需要担心大文件导致的内存溢出
+- 但要确保正确销毁流
+
+#### 11.5.3 HEAD 请求的处理
+
+**1. 理解 HEAD 请求**：
+- HEAD 请求只返回响应头，不返回响应体
+- 客户端用于检查资源的元数据
+- 特别是 Content-Length
+
+**2. Koa 的自动处理**：
+- Koa 会自动处理 HEAD 请求
+- 会设置 Content-Length 头（如果可能）
+- 不会发送响应体
+
+**3. 特殊情况**：
+- 如果响应体是 Stream，Content-Length 可能无法确定
+- 这时 Koa 不会设置 Content-Length
+- 客户端可能需要使用其他方式获取资源大小
+
+#### 11.5.4 绕过 Koa 响应处理
+
+**何时使用**：
+- 需要完全自定义响应处理
+- 需要使用底层的 HTTP 模块 API
+- 需要特殊的响应处理逻辑
+
+**示例**：
+
+```javascript
+app.use(async (ctx) => {
+  // 绕过 Koa 的响应处理
+  ctx.respond = false
+  
+  // 直接使用 Node.js 的 HTTP API
+  ctx.res.statusCode = 200
+  ctx.res.setHeader('Content-Type', 'text/plain')
+  ctx.res.end('Hello from raw Node.js!')
+})
+```
+
+**注意事项**：
+- 绕过 Koa 处理后，Koa 不会处理任何响应逻辑
+- 需要手动处理所有响应细节
+- 包括状态码、响应头、响应体等
+- 错误处理也需要自己处理
+
+### 11.6 常见问题
+
+#### 11.6.1 为什么我的 Stream 响应没有 Content-Length？
+
+**原因**：
+- Stream 类型的响应体大小在发送前是未知的
+- Koa 无法提前计算 Content-Length
+- 这是正常的行为
+
+**解决方案**：
+- 如果知道文件大小，可以手动设置 Content-Length
+- 或者使用 HTTP/1.1 的分块传输编码（Transfer-Encoding: chunked）
+- 客户端通常可以处理这种情况
+
+**示例**：
+
+```javascript
+const fs = require('fs')
+const { stat } = require('fs/promises')
+
+app.use(async (ctx) => {
+  const filePath = 'large-file.zip'
+  
+  // 获取文件大小
+  const stats = await stat(filePath)
+  
+  // 创建可读流
+  const readStream = fs.createReadStream(filePath)
+  
+  // 设置响应体为 Stream
+  ctx.body = readStream
+  
+  // 手动设置 Content-Length
+  ctx.length = stats.size
+  
+  // 设置其他响应头
+  ctx.type = 'application/zip'
+  ctx.attachment('large-file.zip')
+})
+```
+
+#### 11.6.2 为什么我的 JSON 响应没有被序列化？
+
+**可能的原因**：
+
+1. **body 已经是字符串**：
+   - 如果 `ctx.body` 已经是字符串，Koa 会直接发送
+   - 不会再进行 JSON 序列化
+
+2. **绕过了 Koa 处理**：
+   - 如果 `ctx.respond === false`，Koa 不会处理响应
+   - 需要自己序列化
+
+3. **Content-Type 问题**：
+   - 确保没有手动设置错误的 Content-Type
+   - Koa 会自动设置 `application/json`，但如果手动设置了其他值，会使用手动设置的值
+
+**排查方法**：
+
+```javascript
+app.use(async (ctx) => {
+  const data = { message: 'Hello' }
+  
+  // 确保是对象，不是字符串
+  console.log(typeof data) // 应该是 'object'
+  
+  ctx.body = data
+  
+  // 检查 Content-Type
+  console.log(ctx.type) // 应该是 'application/json'
+})
+```
+
+#### 11.6.3 如何处理大文件下载？
+
+**最佳实践**：
+
+1. **使用 Stream 类型**：
+   - 不要将整个文件加载到内存
+   - 使用 `fs.createReadStream()` 创建可读流
+
+2. **设置正确的响应头**：
+   - `Content-Type`：文件的 MIME 类型
+   - `Content-Disposition`：设置为 attachment，触发下载
+   - `Content-Length`：如果知道文件大小，设置这个头
+
+3. **错误处理**：
+   - Stream 可能会出错（如文件不存在、权限问题等）
+   - Koa 会通过 `ctx.onerror` 处理错误
+   - 但最好也在业务逻辑中处理
+
+**完整示例**：
+
+```javascript
+const fs = require('fs')
+const { stat } = require('fs/promises')
+const path = require('path')
+
+app.use(async (ctx) => {
+  const filename = ctx.params.filename
+  const filePath = path.join(__dirname, 'downloads', filename)
+  
+  try {
+    // 检查文件是否存在
+    const stats = await stat(filePath)
+    if (!stats.isFile()) {
+      ctx.status = 404
+      ctx.body = 'File not found'
+      return
+    }
+    
+    // 创建可读流
+    const readStream = fs.createReadStream(filePath)
+    
+    // 设置响应体为 Stream
+    ctx.body = readStream
+    
+    // 设置响应头
+    ctx.type = getMimeType(filename) // 根据文件扩展名获取 MIME 类型
+    ctx.length = stats.size
+    ctx.attachment(filename) // 触发浏览器下载
+    
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      ctx.status = 404
+      ctx.body = 'File not found'
+    } else {
+      ctx.status = 500
+      ctx.body = 'Internal server error'
+      console.error('File download error:', err)
+    }
+  }
+})
+
+// 辅助函数：根据文件扩展名获取 MIME 类型
+function getMimeType(filename) {
+  const ext = path.extname(filename).toLowerCase()
+  const mimeTypes = {
+    '.pdf': 'application/pdf',
+    '.zip': 'application/zip',
+    '.jpg': 'image/jpeg',
+    '.png': 'image/png',
+    '.txt': 'text/plain',
+    '.html': 'text/html'
+    // ... 更多类型
+  }
+  return mimeTypes[ext] || 'application/octet-stream'
+}
+```
+
+### 11.7 总结
+
+`respond` 函数是 Koa 中处理响应的核心组件，它负责将中间件设置的响应体正确地发送给客户端。
+
+**核心要点**：
+
+1. **处理流程**：
+   - 预处理阶段：检查是否绕过 Koa 处理、检查响应可写性
+   - 特殊状态码处理：处理不需要响应体的状态码（如 204、304）
+   - HEAD 请求处理：只发送响应头，不发送响应体
+   - Null/Undefined Body 处理：自动生成响应体或发送空响应
+   - 不同 Body 类型处理：根据类型选择不同的发送方式
+
+2. **不同 Body 类型的处理路径**：
+   - **Buffer**：直接发送，适用于二进制数据
+   - **String**：直接发送，适用于文本数据
+   - **Stream**：使用 `Stream.pipeline` 流式传输，适用于大文件和实时数据
+   - **JSON 对象**：使用 `JSON.stringify` 序列化后发送，适用于结构化数据
+
+3. **HEAD 请求的特殊处理**：
+   - 只发送响应头，不发送响应体
+   - 尝试设置 Content-Length 头（如果可能）
+   - 允许客户端检查资源的元数据
+
+4. **最佳实践**：
+   - 根据数据大小和类型选择合适的 Body 类型
+   - 大文件使用 Stream 类型，节省内存
+   - 结构化数据使用 JSON 对象类型，Koa 自动处理
+   - 总是处理 Stream 错误
+   - 理解 HEAD 请求的特殊性
+
+`respond` 函数的设计体现了 Koa 的简洁和灵活：
+- 自动处理常见的响应类型
+- 提供足够的灵活性（如绕过 Koa 处理）
+- 良好的错误处理机制
+- 支持现代 Web API（如 Blob、ReadableStream、Response）
+
+这种设计使得 Koa 既适合简单的 API 开发，也适合复杂的文件下载和实时数据推送场景。
+
+## 12. 参考资料
 
 - [Koa 官方文档](https://koajs.com/)
 - [koa-compose 源码](https://github.com/koajs/compose)
@@ -1696,3 +2583,6 @@ app.listen(3000);
 - [Node.js AsyncLocalStorage 官方文档](https://nodejs.org/api/async_context.html#class-asynclocalstorage)
 - [Node.js 异步上下文追踪](https://nodejs.org/api/async_context.html)
 - [AsyncLocalStorage 与 Koa3.0 上下文管理机制](https://juejin.cn/post/7498635253557690404)
+- [Node.js Stream.pipeline 文档](https://nodejs.org/api/stream.html#stream_stream_pipeline_streams_callback)
+- [Node.js HTTP 响应文档](https://nodejs.org/api/http.html#class-httpserverresponse)
+- [HTTP 状态码定义](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
