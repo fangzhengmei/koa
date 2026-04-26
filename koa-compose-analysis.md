@@ -2574,7 +2574,1314 @@ function getMimeType(filename) {
 
 这种设计使得 Koa 既适合简单的 API 开发，也适合复杂的文件下载和实时数据推送场景。
 
-## 12. 参考资料
+## 12. Context 对象的创建与委托代理机制深度分析
+
+在 Koa 中，`ctx`（Context）对象是一个核心概念，它封装了 Node.js 原生的 `req` 和 `res` 对象，并提供了统一、友好的 API 供中间件使用。理解 `ctx` 对象的创建过程和委托代理机制，对于深入理解 Koa 的设计思想至关重要。
+
+### 12.1 createContext() 方法的实现
+
+#### 12.1.1 完整源码分析
+
+在 `lib/application.js` 中，`createContext()` 方法负责将 Node.js 原生的 `req` 和 `res` 封装成 Koa 的 `ctx` 对象：
+
+```javascript
+createContext (req, res) {
+  /** @type {Context} */
+  const context = Object.create(this.context)
+  /** @type {KoaRequest} */
+  const request = (context.request = Object.create(this.request))
+  /** @type {KoaResponse} */
+  const response = (context.response = Object.create(this.response))
+  context.app = request.app = response.app = this
+  context.req = request.req = response.req = req
+  context.res = request.res = response.res = res
+  request.ctx = response.ctx = context
+  request.response = response
+  response.request = request
+  context.originalUrl = request.originalUrl = req.url
+  context.state = {}
+  return context
+}
+```
+
+#### 12.1.2 对象创建流程
+
+让我们详细分析 `createContext()` 方法的执行流程：
+
+**1. 创建 Context 对象**：
+
+```javascript
+const context = Object.create(this.context)
+```
+
+- 使用 `Object.create(this.context)` 创建一个新的 `context` 对象
+- `this.context` 是 `lib/context.js` 导出的原型对象
+- 新对象的原型链指向 `this.context`，因此继承了所有 Context 原型的方法和属性
+
+**2. 创建 Request 对象**：
+
+```javascript
+const request = (context.request = Object.create(this.request))
+```
+
+- 使用 `Object.create(this.request)` 创建一个新的 `request` 对象
+- `this.request` 是 `lib/request.js` 导出的原型对象
+- 同时将 `request` 对象赋值给 `context.request`，建立引用关系
+
+**3. 创建 Response 对象**：
+
+```javascript
+const response = (context.response = Object.create(this.response))
+```
+
+- 使用 `Object.create(this.response)` 创建一个新的 `response` 对象
+- `this.response` 是 `lib/response.js` 导出的原型对象
+- 同时将 `response` 对象赋值给 `context.response`，建立引用关系
+
+**为什么使用 Object.create()**：
+
+使用 `Object.create()` 而不是 `new` 关键字的原因：
+
+1. **原型继承**：
+   - `Object.create(proto)` 创建一个新对象，其 `__proto__` 指向 `proto`
+   - 这样新对象就继承了 `proto` 上的所有方法和属性
+   - 但不会执行构造函数，避免了不必要的初始化
+
+2. **共享原型，实例独立**：
+   - 所有请求共享同一个原型对象（`this.context`、`this.request`、`this.response`）
+   - 但每个请求都有自己独立的实例对象
+   - 这样既节省了内存，又保证了请求之间的隔离
+
+3. **灵活的原型链**：
+   - 可以通过修改原型对象来添加或修改方法
+   - 所有实例都会继承这些修改
+   - 但每个实例可以有自己的属性值
+
+#### 12.1.3 引用关系建立
+
+`createContext()` 方法的核心部分是建立各种对象之间的引用关系：
+
+```javascript
+context.app = request.app = response.app = this
+context.req = request.req = response.req = req
+context.res = request.res = response.res = res
+request.ctx = response.ctx = context
+request.response = response
+response.request = request
+context.originalUrl = request.originalUrl = req.url
+context.state = {}
+```
+
+让我们逐一分析这些引用关系：
+
+**1. app 引用**：
+
+```javascript
+context.app = request.app = response.app = this
+```
+
+- `this` 是当前的 Koa Application 实例
+- `context.app`、`request.app`、`response.app` 都指向同一个 Application 实例
+- 这样在任何对象中都可以访问到应用级别的属性和方法
+
+**2. 原生 req 引用**：
+
+```javascript
+context.req = request.req = response.req = req
+```
+
+- `req` 是 Node.js 原生的 `http.IncomingMessage` 对象
+- `context.req`、`request.req`、`response.req` 都指向同一个原生请求对象
+- 这样在任何对象中都可以访问到原始的请求信息
+
+**3. 原生 res 引用**：
+
+```javascript
+context.res = request.res = response.res = res
+```
+
+- `res` 是 Node.js 原生的 `http.ServerResponse` 对象
+- `context.res`、`request.res`、`response.res` 都指向同一个原生响应对象
+- 这样在任何对象中都可以访问到原始的响应对象
+
+**4. ctx 双向引用**：
+
+```javascript
+request.ctx = response.ctx = context
+```
+
+- `request.ctx` 和 `response.ctx` 都指向 `context` 对象
+- 这样在 Request 和 Response 对象中也可以访问到 Context 对象
+- 形成了双向引用关系
+
+**5. request 和 response 双向引用**：
+
+```javascript
+request.response = response
+response.request = request
+```
+
+- `request.response` 指向 `response` 对象
+- `response.request` 指向 `request` 对象
+- 这样 Request 和 Response 对象之间也可以互相访问
+
+**6. originalUrl 设置**：
+
+```javascript
+context.originalUrl = request.originalUrl = req.url
+```
+
+- `originalUrl` 是请求的原始 URL
+- 这个值在请求开始时设置，之后不会改变
+- 即使中间件修改了 `ctx.url`，`originalUrl` 仍然保持不变
+- 这对于日志记录和错误追踪非常有用
+
+**7. state 初始化**：
+
+```javascript
+context.state = {}
+```
+
+- `state` 是一个空对象，用于在中间件之间传递数据
+- 中间件可以将需要共享的数据存储在 `ctx.state` 中
+- 例如：用户信息、数据库连接、配置等
+
+#### 12.1.4 对象关系图
+
+让我们通过一个图表来理解这些对象之间的关系：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Application (app)                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  this.context (Context 原型)                                          │  │
+│  │  - 属性和方法来自 lib/context.js                                      │  │
+│  │  - 通过 delegates 委托到 request 和 response                          │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  this.request (Request 原型)                                          │  │
+│  │  - 属性和方法来自 lib/request.js                                      │  │
+│  │  - 封装原生 req 对象                                                    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  this.response (Response 原型)                                        │  │
+│  │  - 属性和方法来自 lib/response.js                                     │  │
+│  │  - 封装原生 res 对象                                                    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ 每个请求创建新实例
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Context 实例 (context)                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  属性：                                                              │  │
+│  │  - context.app = this (Application)                                 │  │
+│  │  - context.req = req (原生 IncomingMessage)                         │  │
+│  │  - context.res = res (原生 ServerResponse)                          │  │
+│  │  - context.request = request (Request 实例)                         │  │
+│  │  - context.response = response (Response 实例)                       │  │
+│  │  - context.originalUrl = req.url                                     │  │
+│  │  - context.state = {}                                                │  │
+│  │                                                                       │  │
+│  │  方法：                                                              │  │
+│  │  - 继承自 this.context (通过 Object.create)                          │  │
+│  │  - 通过 delegates 委托到 request 和 response                         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ┌─────────────────────┐         双向引用         ┌─────────────────────┐ │
+│  │  Request 实例        │◄────────────────────────►│  Response 实例       │ │
+│  │  ┌─────────────────┐ │                          │  ┌─────────────────┐ │ │
+│  │  │ request.app     │ │  request.response =     │  │ response.app    │ │ │
+│  │  │ = this          │ │  response                │  │ = this          │ │ │
+│  │  │ request.req     │ │                          │  │ response.req    │ │ │
+│  │  │ = req           │ │  response.request =     │  │ = req           │ │ │
+│  │  │ request.res     │ │  request                 │  │ response.res    │ │ │
+│  │  │ = res           │ │                          │  │ = res           │ │ │
+│  │  │ request.ctx     │ │                          │  │ response.ctx    │ │ │
+│  │  │ = context       │ │                          │  │ = context       │ │ │
+│  │  │ request.        │ │                          │  │ response.       │ │ │
+│  │  │ originalUrl =   │ │                          │  │                 │ │ │
+│  │  │ req.url         │ │                          │  │                 │ │ │
+│  │  └─────────────────┘ │                          │  └─────────────────┘ │ │
+│  └─────────────────────┘                          └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 委托代理机制的实现
+
+#### 12.2.1 delegates 库的使用
+
+在 `lib/context.js` 中，Koa 使用 `delegates` 库来实现委托代理机制。这个库允许将一个对象的属性和方法委托到另一个对象。
+
+**delegates 库的核心 API**：
+
+`delegates` 库提供了以下几种委托方式：
+
+1. **method(name)**：
+   - 委托方法调用
+   - 当调用 `context.name(...)` 时，实际调用的是 `context.[target].name(...)`
+
+2. **access(name)**：
+   - 委托属性的 getter 和 setter
+   - 当访问 `context.name` 时，实际访问的是 `context.[target].name`
+   - 当设置 `context.name = value` 时，实际设置的是 `context.[target].name = value`
+
+3. **getter(name)**：
+   - 只委托属性的 getter
+   - 当访问 `context.name` 时，实际访问的是 `context.[target].name`
+   - 但不能设置 `context.name = value`（只读）
+
+**Koa 中的委托配置**：
+
+在 `lib/context.js` 中，有以下委托配置：
+
+```javascript
+/**
+ * Response delegation.
+ */
+
+delegate(proto, 'response')
+  .method('attachment')
+  .method('redirect')
+  .method('remove')
+  .method('vary')
+  .method('has')
+  .method('set')
+  .method('append')
+  .method('flushHeaders')
+  .method('back')
+  .access('status')
+  .access('message')
+  .access('body')
+  .access('length')
+  .access('type')
+  .access('lastModified')
+  .access('etag')
+  .getter('headerSent')
+  .getter('writable')
+
+/**
+ * Request delegation.
+ */
+
+delegate(proto, 'request')
+  .method('acceptsLanguages')
+  .method('acceptsEncodings')
+  .method('acceptsCharsets')
+  .method('accepts')
+  .method('get')
+  .method('is')
+  .access('querystring')
+  .access('idempotent')
+  .access('socket')
+  .access('search')
+  .access('method')
+  .access('query')
+  .access('path')
+  .access('url')
+  .access('accept')
+  .getter('origin')
+  .getter('href')
+  .getter('subdomains')
+  .getter('protocol')
+  .getter('host')
+  .getter('hostname')
+  .getter('URL')
+  .getter('header')
+  .getter('headers')
+  .getter('secure')
+  .getter('stale')
+  .getter('fresh')
+  .getter('ips')
+  .getter('ip')
+```
+
+#### 12.2.2 方法委托
+
+**Response 方法委托**：
+
+```javascript
+delegate(proto, 'response')
+  .method('attachment')
+  .method('redirect')
+  .method('remove')
+  .method('vary')
+  .method('has')
+  .method('set')
+  .method('append')
+  .method('flushHeaders')
+  .method('back')
+```
+
+**这些方法的作用**：
+
+1. **attachment(filename)**：
+   - 设置 `Content-Disposition` 头为 "attachment"
+   - 触发浏览器下载
+   - 示例：`ctx.attachment('report.pdf')`
+
+2. **redirect(url)**：
+   - 执行重定向
+   - 默认状态码为 302
+   - 示例：`ctx.redirect('/login')`
+
+3. **remove(field)**：
+   - 移除响应头
+   - 示例：`ctx.remove('X-Powered-By')`
+
+4. **vary(field)**：
+   - 添加 Vary 响应头
+   - 用于缓存控制
+   - 示例：`ctx.vary('User-Agent')`
+
+5. **has(field)**：
+   - 检查响应头是否存在
+   - 示例：`if (ctx.has('Content-Type')) { ... }`
+
+6. **set(field, value)**：
+   - 设置响应头
+   - 示例：`ctx.set('X-Custom-Header', 'value')`
+
+7. **append(field, value)**：
+   - 追加响应头（而不是覆盖）
+   - 示例：`ctx.append('Link', '<http://example.com>')`
+
+8. **flushHeaders()**：
+   - 刷新响应头
+   - 用于需要立即发送响应头的场景
+
+9. **back(alt)**：
+   - 重定向到 Referrer
+   - 如果没有 Referrer，使用 `alt` 或 '/'
+   - 示例：`ctx.back('/home')`
+
+**Request 方法委托**：
+
+```javascript
+delegate(proto, 'request')
+  .method('acceptsLanguages')
+  .method('acceptsEncodings')
+  .method('acceptsCharsets')
+  .method('accepts')
+  .method('get')
+  .method('is')
+```
+
+**这些方法的作用**：
+
+1. **acceptsLanguages(lang...)**：
+   - 检查客户端接受的语言
+   - 示例：`const lang = ctx.acceptsLanguages('zh', 'en')`
+
+2. **acceptsEncodings(encoding...)**：
+   - 检查客户端接受的编码
+   - 示例：`const encoding = ctx.acceptsEncodings('gzip', 'deflate')`
+
+3. **acceptsCharsets(charset...)**：
+   - 检查客户端接受的字符集
+   - 示例：`const charset = ctx.acceptsCharsets('utf-8', 'gbk')`
+
+4. **accepts(type...)**：
+   - 检查客户端接受的内容类型
+   - 示例：`const type = ctx.accepts('json', 'html')`
+
+5. **get(field)**：
+   - 获取请求头
+   - 示例：`const contentType = ctx.get('Content-Type')`
+
+6. **is(type...)**：
+   - 检查请求的 Content-Type
+   - 示例：`if (ctx.is('json')) { ... }`
+
+#### 12.2.3 属性委托
+
+**Response 属性委托（access）**：
+
+```javascript
+delegate(proto, 'response')
+  .access('status')
+  .access('message')
+  .access('body')
+  .access('length')
+  .access('type')
+  .access('lastModified')
+  .access('etag')
+```
+
+**这些属性的作用**：
+
+1. **status**：
+   - 获取或设置 HTTP 状态码
+   - 示例：`ctx.status = 404`
+   - 委托到 `ctx.response.status`
+
+2. **message**：
+   - 获取或设置 HTTP 状态消息
+   - 示例：`ctx.message = 'Not Found'`
+   - 委托到 `ctx.response.message`
+
+3. **body**：
+   - 获取或设置响应体
+   - 这是最常用的属性
+   - 示例：`ctx.body = { message: 'Hello' }`
+   - 委托到 `ctx.response.body`
+
+4. **length**：
+   - 获取或设置 Content-Length
+   - 示例：`ctx.length = 1024`
+   - 委托到 `ctx.response.length`
+
+5. **type**：
+   - 获取或设置 Content-Type
+   - 示例：`ctx.type = 'application/json'`
+   - 委托到 `ctx.response.type`
+
+6. **lastModified**：
+   - 获取或设置 Last-Modified 头
+   - 示例：`ctx.lastModified = new Date()`
+   - 委托到 `ctx.response.lastModified`
+
+7. **etag**：
+   - 获取或设置 ETag 头
+   - 示例：`ctx.etag = 'abc123'`
+   - 委托到 `ctx.response.etag`
+
+**Request 属性委托（access）**：
+
+```javascript
+delegate(proto, 'request')
+  .access('querystring')
+  .access('idempotent')
+  .access('socket')
+  .access('search')
+  .access('method')
+  .access('query')
+  .access('path')
+  .access('url')
+  .access('accept')
+```
+
+**这些属性的作用**：
+
+1. **querystring**：
+   - 获取或设置查询字符串（不包括 ?）
+   - 示例：`const qs = ctx.querystring`
+   - 委托到 `ctx.request.querystring`
+
+2. **idempotent**：
+   - 检查请求方法是否幂等
+   - 幂等方法：GET, HEAD, PUT, DELETE, OPTIONS, TRACE
+   - 示例：`if (ctx.idempotent) { ... }`
+   - 委托到 `ctx.request.idempotent`
+
+3. **socket**：
+   - 获取请求的 socket
+   - 示例：`const socket = ctx.socket`
+   - 委托到 `ctx.request.socket`
+
+4. **search**：
+   - 获取或设置查询字符串（包括 ?）
+   - 示例：`const search = ctx.search`
+   - 委托到 `ctx.request.search`
+
+5. **method**：
+   - 获取或设置请求方法
+   - 示例：`const method = ctx.method`
+   - 委托到 `ctx.request.method`
+
+6. **query**：
+   - 获取或设置解析后的查询参数对象
+   - 示例：`const { page, size } = ctx.query`
+   - 委托到 `ctx.request.query`
+
+7. **path**：
+   - 获取或设置请求路径
+   - 示例：`const path = ctx.path`
+   - 委托到 `ctx.request.path`
+
+8. **url**：
+   - 获取或设置完整的 URL（包括路径和查询字符串）
+   - 示例：`const url = ctx.url`
+   - 委托到 `ctx.request.url`
+
+9. **accept**：
+   - 获取 Accept 对象
+   - 用于内容协商
+   - 示例：`const accept = ctx.accept`
+   - 委托到 `ctx.request.accept`
+
+#### 12.2.4 只读属性委托
+
+**Response 只读属性委托（getter）**：
+
+```javascript
+delegate(proto, 'response')
+  .getter('headerSent')
+  .getter('writable')
+```
+
+**这些属性的作用**：
+
+1. **headerSent**：
+   - 检查响应头是否已发送
+   - 示例：`if (!ctx.headerSent) { ... }`
+   - 委托到 `ctx.response.headerSent`
+
+2. **writable**：
+   - 检查响应是否可写
+   - 示例：`if (ctx.writable) { ... }`
+   - 委托到 `ctx.response.writable`
+
+**Request 只读属性委托（getter）**：
+
+```javascript
+delegate(proto, 'request')
+  .getter('origin')
+  .getter('href')
+  .getter('subdomains')
+  .getter('protocol')
+  .getter('host')
+  .getter('hostname')
+  .getter('URL')
+  .getter('header')
+  .getter('headers')
+  .getter('secure')
+  .getter('stale')
+  .getter('fresh')
+  .getter('ips')
+  .getter('ip')
+```
+
+**这些属性的作用**：
+
+1. **origin**：
+   - 获取请求的 origin
+   - 示例：`const origin = ctx.origin`
+   - 委托到 `ctx.request.origin`
+
+2. **href**：
+   - 获取完整的请求 URL（包括协议、主机、路径）
+   - 示例：`const href = ctx.href`
+   - 委托到 `ctx.request.href`
+
+3. **subdomains**：
+   - 获取子域名数组
+   - 示例：`const subdomains = ctx.subdomains`
+   - 委托到 `ctx.request.subdomains`
+
+4. **protocol**：
+   - 获取请求协议（http 或 https）
+   - 示例：`const protocol = ctx.protocol`
+   - 委托到 `ctx.request.protocol`
+
+5. **host**：
+   - 获取请求主机（包括端口）
+   - 示例：`const host = ctx.host`
+   - 委托到 `ctx.request.host`
+
+6. **hostname**：
+   - 获取请求主机名（不包括端口）
+   - 示例：`const hostname = ctx.hostname`
+   - 委托到 `ctx.request.hostname`
+
+7. **URL**：
+   - 获取解析后的 URL 对象
+   - 示例：`const url = ctx.URL`
+   - 委托到 `ctx.request.URL`
+
+8. **header**：
+   - 获取请求头对象
+   - 示例：`const headers = ctx.header`
+   - 委托到 `ctx.request.header`
+
+9. **headers**：
+   - 获取请求头对象（header 的别名）
+   - 示例：`const headers = ctx.headers`
+   - 委托到 `ctx.request.headers`
+
+10. **secure**：
+    - 检查请求是否是 HTTPS
+    - 示例：`if (ctx.secure) { ... }`
+    - 委托到 `ctx.request.secure`
+
+11. **stale**：
+    - 检查请求是否过期（与 fresh 相反）
+    - 示例：`if (ctx.stale) { ... }`
+    - 委托到 `ctx.request.stale`
+
+12. **fresh**：
+    - 检查请求是否新鲜（用于缓存验证）
+    - 示例：`if (ctx.fresh) { ... }`
+    - 委托到 `ctx.request.fresh`
+
+13. **ips**：
+    - 获取 IP 地址列表（包括代理）
+    - 示例：`const ips = ctx.ips`
+    - 委托到 `ctx.request.ips`
+
+14. **ip**：
+    - 获取客户端 IP 地址
+    - 示例：`const ip = ctx.ip`
+    - 委托到 `ctx.request.ip`
+
+#### 12.2.5 delegates 库的实现原理
+
+虽然 `delegates` 库是外部依赖，但理解它的实现原理对于理解 Koa 的委托机制很有帮助。
+
+**method 委托的实现**：
+
+`delegate(proto, 'response').method('attachment')` 大致相当于：
+
+```javascript
+proto.attachment = function(...args) {
+  return this.response.attachment(...args)
+}
+```
+
+**access 委托的实现**：
+
+`delegate(proto, 'response').access('body')` 大致相当于：
+
+```javascript
+Object.defineProperty(proto, 'body', {
+  get() {
+    return this.response.body
+  },
+  set(val) {
+    this.response.body = val
+  },
+  configurable: true,
+  enumerable: true
+})
+```
+
+**getter 委托的实现**：
+
+`delegate(proto, 'response').getter('headerSent')` 大致相当于：
+
+```javascript
+Object.defineProperty(proto, 'headerSent', {
+  get() {
+    return this.response.headerSent
+  },
+  configurable: true,
+  enumerable: true
+})
+```
+
+**为什么使用 delegates 库**：
+
+1. **代码简洁**：
+   - 使用链式 API，代码更加清晰易读
+   - 不需要手动编写大量的 getter 和 setter
+
+2. **一致的行为**：
+   - 所有委托都遵循相同的模式
+   - 减少了手动编写代码可能带来的错误
+
+3. **可维护性**：
+   - 集中管理所有委托关系
+   - 容易添加、修改或删除委托
+
+4. **性能**：
+   - 在原型上定义属性和方法
+   - 所有实例共享同一个定义
+   - 不需要在每个实例上重复定义
+
+### 12.3 Request 对象的封装
+
+#### 12.3.1 核心属性
+
+`lib/request.js` 定义了 Koa 的 Request 原型对象，它封装了 Node.js 原生的 `req` 对象，提供了更友好的 API。
+
+**属性访问模式**：
+
+Request 对象的大多数属性都是通过 getter 和 setter 来访问的，它们内部操作的是原生的 `req` 对象。
+
+**示例**：
+
+```javascript
+get header () {
+  return this.req.headers
+},
+
+set header (val) {
+  this.req.headers = val
+},
+
+get url () {
+  return this.req.url
+},
+
+set url (val) {
+  this.req.url = val
+},
+
+get path () {
+  return parse(this.req).pathname
+},
+
+set path (path) {
+  const url = parse(this.req)
+  if (url.pathname === path) return
+
+  url.pathname = path
+  url.path = null
+
+  this.url = stringify(url)
+}
+```
+
+**设计要点**：
+
+1. **封装原生对象**：
+   - Request 对象内部持有原生的 `req` 对象
+   - 但通过 getter 和 setter 提供了更高级的 API
+
+2. **延迟计算**：
+   - 很多属性是按需计算的
+   - 例如：`path` 是通过 `parse(this.req).pathname` 计算的
+   - 这样避免了不必要的计算
+
+3. **缓存机制**：
+   - 某些属性会被缓存
+   - 例如：`query` 会被缓存在 `this._querycache` 中
+   - 这样提高了访问性能
+
+4. **可写性**：
+   - 很多属性不仅可读，还可写
+   - 例如：`path` 可以修改，修改后会更新 `url`
+   - 这样提供了很大的灵活性
+
+#### 12.3.2 核心方法
+
+Request 对象还提供了一些核心方法，用于操作请求。
+
+**示例**：
+
+```javascript
+accepts (...args) {
+  return this.accept.types(...args)
+},
+
+acceptsLanguages (...args) {
+  return this.accept.languages(...args)
+},
+
+acceptsEncodings (...args) {
+  return this.accept.encodings(...args)
+},
+
+acceptsCharsets (...args) {
+  return this.accept.charsets(...args)
+},
+
+get (field) {
+  const req = this.req
+  switch (field = field.toLowerCase()) {
+    case 'referer':
+    case 'referrer':
+      return req.headers.referrer || req.headers.referer || ''
+    default:
+      return req.headers[field] || ''
+  }
+},
+
+is (type, ...types) {
+  return typeis(this.req, type, ...types)
+}
+```
+
+**设计要点**：
+
+1. **封装第三方库**：
+   - `accepts` 方法封装了 `accepts` 库
+   - `is` 方法封装了 `type-is` 库
+   - 这样提供了统一的 API
+
+2. **便捷方法**：
+   - `get` 方法提供了便捷的请求头访问
+   - 特别处理了 `referer` 和 `referrer` 的别名
+   - 返回空字符串而不是 undefined
+
+3. **链式 API**：
+   - 方法调用可以链式组合
+   - 例如：`ctx.accepts('json', 'html')`
+
+#### 12.3.3 与原生 req 的关系
+
+Request 对象和原生 `req` 对象的关系：
+
+1. **持有引用**：
+   - Request 对象内部持有 `this.req`，指向原生的 `IncomingMessage` 对象
+   - 所有属性和方法最终都操作的是 `this.req`
+
+2. **增强功能**：
+   - Request 对象提供了比原生 `req` 更强大的功能
+   - 例如：`path`、`query`、`host` 等属性
+
+3. **可访问性**：
+   - 开发者仍然可以通过 `ctx.req` 访问原生的 `req` 对象
+   - 这样在需要时可以使用原生 API
+
+**实际使用示例**：
+
+```javascript
+app.use(async (ctx) => {
+  // 通过委托访问 Request 属性
+  console.log(ctx.method)      // 委托到 ctx.request.method
+  console.log(ctx.path)        // 委托到 ctx.request.path
+  console.log(ctx.query)       // 委托到 ctx.request.query
+  console.log(ctx.header)      // 委托到 ctx.request.header
+  
+  // 通过委托访问 Request 方法
+  console.log(ctx.accepts('json', 'html'))  // 委托到 ctx.request.accepts
+  console.log(ctx.get('Content-Type'))      // 委托到 ctx.request.get
+  console.log(ctx.is('json'))               // 委托到 ctx.request.is
+  
+  // 直接访问 Request 对象
+  console.log(ctx.request.method)  // 直接访问
+  console.log(ctx.request.path)    // 直接访问
+  
+  // 访问原生 req 对象
+  console.log(ctx.req.method)  // 原生方法
+  console.log(ctx.req.url)     // 原生属性
+})
+```
+
+### 12.4 Response 对象的封装
+
+#### 12.4.1 核心属性
+
+`lib/response.js` 定义了 Koa 的 Response 原型对象，它封装了 Node.js 原生的 `res` 对象，提供了更友好的 API。
+
+**属性访问模式**：
+
+Response 对象的大多数属性也是通过 getter 和 setter 来访问的，它们内部操作的是原生的 `res` 对象或内部状态。
+
+**示例**：
+
+```javascript
+get status () {
+  return this.res.statusCode
+},
+
+set status (code) {
+  if (this.headerSent) return
+
+  assert(Number.isInteger(code), 'status code must be a number')
+  assert(code >= 100 && code <= 999, `invalid status code: ${code}`)
+  this._explicitStatus = true
+  this.res.statusCode = code
+  if (this.req.httpVersionMajor < 2) this.res.statusMessage = statuses.message[code]
+  if (this.body && statuses.empty[code]) this.body = null
+},
+
+get body () {
+  return this._body
+},
+
+set body (val) {
+  const original = this._body
+  this._body = val
+
+  const cleanupPreviousStream = () => {
+    if (original && isStream(original)) {
+      original.once('error', () => {})
+      if (!isStream(val)) {
+        destroy(original)
+      }
+    }
+  }
+
+  // 根据 val 的类型进行不同处理
+  // null/undefined、string、buffer、stream、json 等
+  // ...
+}
+```
+
+**设计要点**：
+
+1. **封装原生对象**：
+   - Response 对象内部持有原生的 `res` 对象
+   - 但通过 getter 和 setter 提供了更高级的 API
+
+2. **验证和断言**：
+   - setter 中包含验证逻辑
+   - 例如：`status` setter 验证状态码是否为整数，是否在有效范围内
+
+3. **副作用处理**：
+   - 设置某些属性会触发其他操作
+   - 例如：设置 `status` 会同时设置 `statusMessage`，如果状态码不需要 body，会清除 `body`
+
+4. **内部状态**：
+   - Response 对象维护一些内部状态
+   - 例如：`_body` 存储响应体，`_explicitStatus` 标记是否显式设置了状态码
+
+#### 12.4.2 核心方法
+
+Response 对象还提供了一些核心方法，用于操作响应。
+
+**示例**：
+
+```javascript
+set (field, val) {
+  if (this.headerSent || !field) return
+
+  if (typeof field === 'string') {
+    this.res.setHeader(field, val)
+  } else {
+    Object.keys(field).forEach(header => this.res.setHeader(header, field[header]))
+  }
+},
+
+get (field) {
+  return this.res.getHeader(field)
+},
+
+remove (field) {
+  if (this.headerSent) return
+
+  this.res.removeHeader(field)
+},
+
+append (field, val) {
+  const prev = this.get(field)
+
+  if (prev) {
+    val = Array.isArray(prev)
+      ? prev.concat(val)
+      : [prev].concat(val)
+  }
+
+  return this.set(field, val)
+},
+
+redirect (url) {
+  if (/^https?:\/\//i.test(url)) {
+    url = new URL(url).toString()
+  }
+  this.set('Location', encodeUrl(url))
+
+  // status
+  if (!statuses.redirect[this.status]) this.status = 302
+
+  // html
+  if (this.ctx.accepts('html')) {
+    url = escape(url)
+    this.type = 'text/html; charset=utf-8'
+    this.body = `Redirecting to ${url}.`
+    return
+  }
+
+  // text
+  this.type = 'text/plain; charset=utf-8'
+  this.body = `Redirecting to ${url}.`
+},
+
+attachment (filename, options) {
+  if (filename && !this.has('Content-Type')) {
+    this.type = extname(filename)
+  }
+  this.set('Content-Disposition', contentDisposition(filename, options))
+}
+```
+
+**设计要点**：
+
+1. **封装原生 API**：
+   - `set`、`get`、`remove` 等方法封装了原生的 `res.setHeader`、`res.getHeader`、`res.removeHeader`
+   - 提供了更友好的 API
+
+2. **便捷方法**：
+   - `append` 方法提供了追加响应头的功能
+   - `redirect` 方法提供了完整的重定向功能
+   - `attachment` 方法提供了文件下载的功能
+
+3. **智能处理**：
+   - `redirect` 方法会根据 Accept 头返回不同的响应格式
+   - `attachment` 方法会根据文件名自动设置 Content-Type
+
+#### 12.4.3 与原生 res 的关系
+
+Response 对象和原生 `res` 对象的关系：
+
+1. **持有引用**：
+   - Response 对象内部持有 `this.res`，指向原生的 `ServerResponse` 对象
+   - 所有属性和方法最终都操作的是 `this.res`
+
+2. **增强功能**：
+   - Response 对象提供了比原生 `res` 更强大的功能
+   - 例如：`body` 属性会自动处理不同类型的响应体
+
+3. **可访问性**：
+   - 开发者仍然可以通过 `ctx.res` 访问原生的 `res` 对象
+   - 这样在需要时可以使用原生 API
+
+**实际使用示例**：
+
+```javascript
+app.use(async (ctx) => {
+  // 通过委托访问 Response 属性
+  ctx.status = 200           // 委托到 ctx.response.status
+  ctx.type = 'application/json' // 委托到 ctx.response.type
+  ctx.body = { message: 'Hello' } // 委托到 ctx.response.body
+  
+  // 通过委托访问 Response 方法
+  ctx.set('X-Custom-Header', 'value')  // 委托到 ctx.response.set
+  ctx.redirect('/login')               // 委托到 ctx.response.redirect
+  ctx.attachment('report.pdf')         // 委托到 ctx.response.attachment
+  
+  // 直接访问 Response 对象
+  ctx.response.status = 200  // 直接访问
+  ctx.response.body = 'Hello' // 直接访问
+  
+  // 访问原生 res 对象
+  ctx.res.statusCode = 200   // 原生方法
+  ctx.res.setHeader('X-Custom', 'value') // 原生方法
+})
+```
+
+### 12.5 实际使用示例
+
+让我们通过一个完整的示例来理解 `ctx` 对象的使用：
+
+```javascript
+const Koa = require('koa')
+const app = new Koa()
+
+// 日志中间件
+app.use(async (ctx, next) => {
+  const start = Date.now()
+  
+  // 使用委托的 Request 属性
+  console.log(`${ctx.method} ${ctx.path}`)
+  console.log(`Host: ${ctx.host}`)
+  console.log(`IP: ${ctx.ip}`)
+  console.log(`Query: ${JSON.stringify(ctx.query)}`)
+  
+  await next()
+  
+  // 使用委托的 Response 属性
+  const ms = Date.now() - start
+  console.log(`Status: ${ctx.status}`)
+  console.log(`Time: ${ms}ms`)
+  console.log(`Content-Type: ${ctx.type}`)
+  console.log(`Content-Length: ${ctx.length}`)
+})
+
+// 错误处理中间件
+app.use(async (ctx, next) => {
+  try {
+    await next()
+  } catch (err) {
+    // 使用委托的 Response 属性和方法
+    ctx.status = err.status || 500
+    ctx.body = {
+      error: err.message
+    }
+    
+    // 直接访问 Response 对象
+    ctx.response.set('X-Error', err.message)
+    
+    // 访问原生 res 对象
+    ctx.res.emit('error', err)
+  }
+})
+
+// 业务中间件
+app.use(async (ctx) => {
+  // 使用委托的 Request 方法
+  if (ctx.accepts('json')) {
+    // 使用委托的 Response 属性
+    ctx.type = 'application/json'
+    ctx.body = {
+      message: 'Hello Koa!',
+      method: ctx.method,
+      path: ctx.path,
+      query: ctx.query,
+      headers: ctx.headers
+    }
+  } else if (ctx.accepts('html')) {
+    // 使用委托的 Response 方法
+    ctx.type = 'text/html'
+    ctx.body = `
+      <html>
+        <body>
+          <h1>Hello Koa!</h1>
+          <p>Method: ${ctx.method}</p>
+          <p>Path: ${ctx.path}</p>
+        </body>
+      </html>
+    `
+  } else {
+    // 使用委托的 Response 属性
+    ctx.type = 'text/plain'
+    ctx.body = 'Hello Koa!'
+  }
+  
+  // 使用委托的 Response 方法
+  ctx.set('X-Powered-By', 'Koa')
+  ctx.vary('Accept')
+})
+
+app.listen(3000, () => {
+  console.log('Server running at http://localhost:3000')
+})
+```
+
+### 12.6 设计原理与优势
+
+#### 12.6.1 原型继承模式
+
+Koa 使用原型继承模式来创建 Context、Request、Response 对象：
+
+```javascript
+const context = Object.create(this.context)
+const request = Object.create(this.request)
+const response = Object.create(this.response)
+```
+
+**优势**：
+
+1. **内存效率**：
+   - 所有请求共享同一个原型对象
+   - 方法和属性只需要定义一次
+   - 每个请求只需要创建一个"空"对象，通过原型链访问方法
+
+2. **可扩展性**：
+   - 可以通过修改原型对象来添加全局方法
+   - 所有实例都会继承这些修改
+   - 例如：`app.context.myMethod = function() { ... }`
+
+3. **隔离性**：
+   - 每个请求有自己独立的实例对象
+   - 实例上的属性不会互相影响
+   - 原型上的方法是共享的，但不会影响实例状态
+
+#### 12.6.2 委托代理模式
+
+Koa 使用委托代理模式来简化 API：
+
+```javascript
+delegate(proto, 'response').access('body')
+delegate(proto, 'request').access('path')
+```
+
+**优势**：
+
+1. **简洁的 API**：
+   - 开发者不需要记住 `ctx.request.path`，只需要记住 `ctx.path`
+   - 不需要记住 `ctx.response.body`，只需要记住 `ctx.body`
+   - API 更加直观和易用
+
+2. **关注点分离**：
+   - Request 对象专注于请求相关的逻辑
+   - Response 对象专注于响应相关的逻辑
+   - Context 对象作为统一的入口，委托到对应的对象
+
+3. **灵活性**：
+   - 开发者仍然可以直接访问 `ctx.request` 和 `ctx.response`
+   - 这样在需要时可以使用更底层的 API
+   - 提供了不同层级的抽象
+
+#### 12.6.3 双向引用模式
+
+Koa 使用双向引用模式来建立对象之间的关系：
+
+```javascript
+context.app = request.app = response.app = this
+context.req = request.req = response.req = req
+context.res = request.res = response.res = res
+request.ctx = response.ctx = context
+request.response = response
+response.request = request
+```
+
+**优势**：
+
+1. **方便的访问**：
+   - 从任何对象都可以访问到其他对象
+   - 例如：`ctx.request.response.ctx` 这样的链式访问
+   - 不需要记住复杂的引用关系
+
+2. **灵活的 API**：
+   - 可以在不同的对象上调用方法
+   - 例如：`ctx.set()` 和 `ctx.response.set()` 是等价的
+   - 提供了多种访问方式
+
+3. **一致性**：
+   - 所有对象都持有相同的引用
+   - 修改一个对象的属性会反映到其他对象
+   - 确保了数据的一致性
+
+#### 12.6.4 与原生对象的关系
+
+Koa 保持了与 Node.js 原生对象的兼容性：
+
+```javascript
+context.req = request.req = response.req = req
+context.res = request.res = response.res = res
+```
+
+**优势**：
+
+1. **兼容性**：
+   - 开发者仍然可以使用原生的 `req` 和 `res` API
+   - 现有的 Node.js 库和中间件可以直接使用
+   - 学习曲线平缓
+
+2. **渐进式增强**：
+   - Koa 提供了更高级的 API，但不强制使用
+   - 开发者可以根据需要选择使用 Koa API 或原生 API
+   - 提供了很大的灵活性
+
+3. **可调试性**：
+   - 原生对象的行为是已知的
+   - 容易定位问题
+   - 可以使用现有的调试工具
+
+### 12.7 总结
+
+Koa 的 Context 对象创建和委托代理机制是其设计的精髓之一，它通过巧妙的设计提供了简洁、灵活、强大的 API。
+
+**核心要点**：
+
+1. **createContext() 方法**：
+   - 使用 `Object.create()` 创建 Context、Request、Response 实例
+   - 建立复杂的引用关系，确保各对象之间可以互相访问
+   - 初始化 `state` 对象，用于中间件之间的数据共享
+
+2. **委托代理机制**：
+   - 使用 `delegates` 库将 Request 和 Response 对象的属性和方法委托到 Context
+   - 支持三种委托方式：`method`（方法委托）、`access`（属性读写委托）、`getter`（只读属性委托）
+   - 这样开发者可以通过 `ctx.path` 访问 `ctx.request.path`，通过 `ctx.body` 访问 `ctx.response.body`
+
+3. **Request 对象封装**：
+   - 封装了 Node.js 原生的 `req` 对象
+   - 提供了更友好的 API，如 `path`、`query`、`host` 等属性
+   - 支持内容协商（`accepts` 方法）、请求类型检查（`is` 方法）等高级功能
+
+4. **Response 对象封装**：
+   - 封装了 Node.js 原生的 `res` 对象
+   - 提供了更友好的 API，如 `status`、`type`、`body` 等属性
+   - 支持重定向（`redirect` 方法）、文件下载（`attachment` 方法）等高级功能
+
+5. **设计模式**：
+   - **原型继承模式**：节省内存，易于扩展
+   - **委托代理模式**：简化 API，关注点分离
+   - **双向引用模式**：方便访问，灵活使用
+   - **与原生对象兼容**：兼容性好，渐进式增强
+
+6. **实际使用**：
+   - 开发者可以通过 `ctx` 对象访问所有请求和响应相关的属性和方法
+   - 不需要关心底层的实现细节
+   - 但在需要时仍然可以访问原生的 `req` 和 `res` 对象
+
+这种设计使得 Koa 既简单易用，又灵活强大。开发者可以快速上手，同时在需要时可以深入底层进行自定义。这种平衡是 Koa 能够成为流行的 Node.js Web 框架的重要原因之一。
+
+## 13. 参考资料
 
 - [Koa 官方文档](https://koajs.com/)
 - [koa-compose 源码](https://github.com/koajs/compose)
