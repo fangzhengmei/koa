@@ -568,7 +568,384 @@ d.getter('headerSent');
    → 返回 this（同一个 Delegator 实例）
 ```
 
-## 4. Getter 和 Setter 的方向对称性分析
+## 4. 直接定义 vs 委托 - 设计边界分析
+
+### 4.1 context.js 完整结构分析
+
+context.js 由两部分组成：
+1. **直接定义在 proto 对象字面量上的属性和方法**（第 20-177 行）
+2. **通过 delegate 机制委托的属性和方法**（第 194-248 行）
+
+### 4.2 直接定义的属性/方法
+
+#### 4.2.1 对象表示/序列化方法
+
+**`inspect()` 方法**（lib/context.js:30-33）：
+```javascript
+inspect () {
+  if (this === proto) return this
+  return this.toJSON()
+}
+```
+- 自定义 `util.inspect()` 实现
+- 这是 Context 作为整体对象的职责，不适合委托
+
+**`toJSON()` 方法**（lib/context.js:47-57）：
+```javascript
+toJSON () {
+  return {
+    request: this.request.toJSON(),
+    response: this.response.toJSON(),
+    app: this.app.toJSON(),
+    originalUrl: this.originalUrl,
+    req: '<original node req>',
+    res: '<original node res>',
+    socket: '<original node socket>'
+  }
+}
+```
+- 聚合了 request、response、app 等多个对象的 JSON 表示
+- **跨对象整合**：需要访问多个来源，不适合委托给单一的 request 或 response
+
+#### 4.2.2 错误处理相关
+
+**`assert` 属性**（lib/context.js:72）：
+```javascript
+assert: httpAssert,
+```
+- 直接引用 `http-assert` 库
+- 简单的属性引用，不是方法定义
+
+**`throw()` 方法**（lib/context.js:95-97）：
+```javascript
+throw (...args) {
+  throw createError(...args)
+}
+```
+- 简单包装 `http-errors` 库的 `createError`
+- 这是 Context 的核心职责之一：提供统一的错误抛出接口
+
+**`onerror()` 方法**（lib/context.js:106-162）：
+- 默认错误处理方法，相当复杂
+- 涉及：
+  - 错误类型检查和规范化
+  - 跨全局对象的 instanceof 检查（处理 jest 测试问题）
+  - 响应头已发送检查
+  - 向 app 发送 error 事件
+  - 清空 headers
+  - 设置响应类型、状态码、body
+  - 结束响应
+- **Context 核心职责**：错误处理是 Context 的核心职责，需要整合多个底层对象
+
+#### 4.2.3 带缓存的延迟初始化
+
+**`cookies` getter/setter**（lib/context.js:164-176）：
+```javascript
+const COOKIES = Symbol('context#cookies')
+
+get cookies () {
+  if (!this[COOKIES]) {
+    this[COOKIES] = new Cookies(this.req, this.res, {
+      keys: this.app.keys,
+      secure: this.request.secure
+    })
+  }
+  return this[COOKIES]
+},
+
+set cookies (_cookies) {
+  this[COOKIES] = _cookies
+}
+```
+
+**关键分析**：
+1. **使用 Symbol 做私有存储**：`COOKIES` 是一个 Symbol，用于存储 cookies 实例
+2. **延迟初始化**：只在第一次访问时才创建 `Cookies` 实例
+3. **需要整合多个来源**：
+   - `this.req`（原始 Node.js 请求对象）
+   - `this.res`（原始 Node.js 响应对象）
+   - `this.app.keys`（应用配置的签名密钥）
+   - `this.request.secure`（Request 对象计算的安全标志）
+4. **不适合委托**：
+   - 委托机制只能简单地读写属性或调用方法
+   - 无法支持这种带缓存、延迟初始化、跨对象整合的复杂逻辑
+
+#### 4.2.4 其他直接定义
+
+**`util.inspect.custom`**（lib/context.js:187-189）：
+```javascript
+if (util.inspect.custom) {
+  module.exports[util.inspect.custom] = module.exports.inspect
+}
+```
+- 为新版本 Node.js 添加的自定义检查实现
+- 这是 Context 作为整体对象的职责
+
+### 4.3 通过 delegate 委托的属性/方法
+
+#### 4.3.1 Response 委托（lib/context.js:195-213）
+
+```javascript
+delegate(proto, 'response')
+  .method('attachment')
+  .method('redirect')
+  .method('remove')
+  .method('vary')
+  .method('has')
+  .method('set')
+  .method('append')
+  .method('flushHeaders')
+  .method('back')
+  .access('status')
+  .access('message')
+  .access('body')
+  .access('length')
+  .access('type')
+  .access('lastModified')
+  .access('etag')
+  .getter('headerSent')
+  .getter('writable')
+```
+
+#### 4.3.2 Request 委托（lib/context.js:219-248）
+
+```javascript
+delegate(proto, 'request')
+  .method('acceptsLanguages')
+  .method('acceptsEncodings')
+  .method('acceptsCharsets')
+  .method('accepts')
+  .method('get')
+  .method('is')
+  .access('querystring')
+  .access('idempotent')
+  .access('socket')
+  .access('search')
+  .access('method')
+  .access('query')
+  .access('path')
+  .access('url')
+  .access('accept')
+  .getter('origin')
+  .getter('href')
+  .getter('subdomains')
+  .getter('protocol')
+  .getter('host')
+  .getter('hostname')
+  .getter('URL')
+  .getter('header')
+  .getter('headers')
+  .getter('secure')
+  .getter('stale')
+  .getter('fresh')
+  .getter('ips')
+  .getter('ip')
+```
+
+### 4.4 两种挂载方式的对比
+
+#### 4.4.1 直接定义的特征
+
+| 特征 | 说明 | 示例 |
+|------|------|------|
+| Context 自身职责 | 这些是 Context 作为整体对象的职责 | `inspect()`, `toJSON()`, `onerror()` |
+| 跨对象整合 | 需要访问多个底层对象（req, res, app, request, response） | `cookies` 需要 req, res, app.keys, request.secure |
+| 复杂逻辑 | 需要缓存、延迟初始化、条件判断 | `cookies` 的延迟初始化和缓存 |
+| 简单引用/包装 | 直接引用外部库或简单包装 | `assert: httpAssert`, `throw()` 包装 createError |
+
+#### 4.4.2 委托的特征
+
+| 特征 | 说明 | 示例 |
+|------|------|------|
+| 纯粹的单一职责 | 所有委托的方法/属性都纯粹属于 Request 或 Response | `status`、`body` 属于 Response；`url`、`method` 属于 Request |
+| 可以完全代理 | 这些操作不需要 Context 额外处理，直接透传即可 | `ctx.status` → `ctx.response.status` |
+| 单向依赖 | 只依赖 request 或 response 其中一个，不需要跨对象整合 | 所有委托的属性 |
+
+### 4.5 设计边界归纳
+
+#### 4.5.1 决策矩阵
+
+| 维度 | 直接定义 | Delegate 委托 |
+|------|---------|--------------|
+| **职责归属** | Context 自身职责，或跨 Request/Response | 纯粹 Request 或纯粹 Response |
+| **依赖来源** | 需要多个来源（req, res, app, request, response） | 单一来源（request 或 response） |
+| **复杂度** | 需要缓存、延迟初始化、复杂逻辑 | 简单透传 |
+| **可代理性** | 无法简单代理 | 可以完全代理 |
+| **控制需求** | 需要 Context 介入控制逻辑 | 不需要额外控制 |
+
+#### 4.5.2 设计原则
+
+Koa 的设计遵循以下原则：
+
+1. **关注点分离**：
+   - Request 负责请求相关的所有操作
+   - Response 负责响应相关的所有操作
+   - Context 负责：
+     - 作为统一入口（通过委托暴露 Request/Response 的常用操作）
+     - 处理跨对象的职责（错误处理、cookies 管理）
+     - 对象表示（inspect、toJSON）
+
+2. **便捷性与清晰性平衡**：
+   - 常用操作通过委托直接暴露在 Context 上（`ctx.status` 而非 `ctx.response.status`）
+   - 复杂逻辑和跨对象操作直接定义在 Context 上，保持清晰
+
+3. **延迟初始化优化**：
+   - `cookies` 使用延迟初始化，只在需要时才创建实例
+   - 这是性能优化，委托机制无法支持这种模式
+
+4. **错误处理的集中化**：
+   - `onerror()` 是 Context 的核心职责
+   - 需要整合多个底层对象的状态（headerSent、writable、res 等）
+   - 不适合委托给单一的 Request 或 Response
+
+#### 4.5.3 边界可视化
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Context (ctx)                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              直接定义在 Context 上的                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │  • inspect()      - 对象检查（Context 整体职责）          │   │
+│  │  • toJSON()       - JSON 序列化（聚合多个对象）           │   │
+│  │  • assert         - 简单引用 httpAssert                  │   │
+│  │  • throw()        - 错误抛出（Context 核心职责）          │   │
+│  │  • onerror()      - 错误处理（跨对象整合）                │   │
+│  │  • cookies        - 延迟初始化 + 多来源整合               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              通过 Delegate 委托的                         │   │
+│  ├───────────────────────┬─────────────────────────────────┤   │
+│  │   委托到 Response     │      委托到 Request              │   │
+│  ├───────────────────────┼─────────────────────────────────┤   │
+│  │  • attachment         │  • acceptsLanguages              │   │
+│  │  • redirect           │  • acceptsEncodings              │   │
+│  │  • remove             │  • acceptsCharsets               │   │
+│  │  • vary               │  • accepts                       │   │
+│  │  • has                │  • get                           │   │
+│  │  • set                │  • is                            │   │
+│  │  • append             │  • querystring (access)          │   │
+│  │  • flushHeaders       │  • idempotent (access)           │   │
+│  │  • back               │  • socket (access)               │   │
+│  │  • status (access)    │  • search (access)               │   │
+│  │  • message (access)   │  • method (access)               │   │
+│  │  • body (access)      │  • query (access)                │   │
+│  │  • length (access)    │  • path (access)                 │   │
+│  │  • type (access)      │  • url (access)                  │   │
+│  │  • lastModified(access)│ • accept (access)               │   │
+│  │  • etag (access)      │  • origin (getter)               │   │
+│  │  • headerSent (getter)│  • href (getter)                 │   │
+│  │  • writable (getter)  │  • subdomains (getter)           │   │
+│  │                       │  • protocol (getter)              │   │
+│  │                       │  • host (getter)                  │   │
+│  │                       │  • hostname (getter)              │   │
+│  │                       │  • URL (getter)                   │   │
+│  │                       │  • header (getter)                │   │
+│  │                       │  • headers (getter)               │   │
+│  │                       │  • secure (getter)                │   │
+│  │                       │  • stale (getter)                 │   │
+│  │                       │  • fresh (getter)                 │   │
+│  │                       │  • ips (getter)                   │   │
+│  │                       │  • ip (getter)                    │   │
+│  └───────────────────────┴─────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.6 代码示例对比
+
+#### 4.6.1 可以委托但选择直接定义的情况
+
+`assert` 和 `throw()` 理论上可以委托，但 Koa 选择直接定义：
+
+```javascript
+// 直接定义（Koa 的选择）
+assert: httpAssert,
+
+throw (...args) {
+  throw createError(...args)
+}
+
+// 理论上可以这样委托（但 Koa 没有这样做）
+// delegate(proto, 'someTarget').method('throw')
+// 但 throw 不是任何对象的方法，而是需要直接抛出错误
+```
+
+**为什么选择直接定义**：
+- `assert` 是简单的属性引用，不需要委托
+- `throw()` 需要直接抛出错误，不是调用某个对象的方法
+- 这些操作语义上属于 Context 自身
+
+#### 4.6.2 无法委托必须直接定义的情况
+
+`cookies` 是最典型的无法委托的例子：
+
+```javascript
+// 直接定义（必须这样做）
+const COOKIES = Symbol('context#cookies')
+
+get cookies () {
+  if (!this[COOKIES]) {
+    this[COOKIES] = new Cookies(this.req, this.res, {
+      keys: this.app.keys,
+      secure: this.request.secure
+    })
+  }
+  return this[COOKIES]
+}
+
+// 无法这样委托
+// delegate(proto, 'request').access('cookies') 
+// ❌ 因为 cookies 不属于 request 或 response
+// ❌ 委托机制无法支持延迟初始化和多来源整合
+```
+
+#### 4.6.3 适合委托的情况
+
+```javascript
+// 委托（Koa 的选择）
+delegate(proto, 'response')
+  .access('status')
+  .access('body')
+
+// 等价于直接定义（但更繁琐）
+// get status () { return this.response.status }
+// set status (val) { this.response.status = val }
+// get body () { return this.response.body }
+// set body (val) { this.response.body = val }
+```
+
+**为什么选择委托**：
+- `status`、`body` 纯粹属于 Response 的职责
+- 委托机制提供了简洁的声明式 API
+- 代码更简洁、更易维护
+
+### 4.7 设计哲学总结
+
+Koa 的 Context 设计体现了以下哲学：
+
+1. **统一入口 + 关注点分离**：
+   - Context 作为统一入口，通过委托暴露常用操作
+   - 但 Request 和 Response 仍然是独立的职责单元
+
+2. **实用主义**：
+   - 能委托的就委托（简化代码）
+   - 不能委托的就直接定义（保持清晰）
+   - 不拘泥于单一模式
+
+3. **性能考量**：
+   - `cookies` 使用延迟初始化，避免不必要的对象创建
+   - 这是务实的性能优化
+
+4. **错误处理的集中化**：
+   - `onerror()` 是 Context 的核心职责
+   - 需要整合多个底层对象的状态
+   - 这是框架级别的错误处理策略
+
+## 5. Getter 和 Setter 的方向对称性分析
 
 ### 4.1 对称性定义
 
