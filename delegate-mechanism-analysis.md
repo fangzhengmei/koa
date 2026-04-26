@@ -66,7 +66,9 @@ Koa 使用了 [delegates](https://www.npmjs.com/package/delegates) 库（版本 
 
 ### 3.2 delegates 库完整源码分析
 
-以下是 delegates 1.0.0 的完整源码（来自 [unpkg.com](https://unpkg.com/delegates@1.0.0/index.js)）：
+以下是 delegates 1.0.0 的完整源码（已通过本地 `node_modules/delegates/index.js` 验证）：
+
+**⚠️ 重要确认**：delegates 1.0.0 **实际使用的是 `__defineGetter__` 和 `__defineSetter__`**，不是 `Object.defineProperty`。`Object.defineProperty` 在报告中仅作为等价对比和标准化示例出现，不是 delegates 库的真实实现。
 
 ```javascript
 /**
@@ -1561,4 +1563,6 @@ Koa 的委托机制体现了以下设计哲学：
 
 *分析基于 Koa 3.2.0 和 delegates 1.0.0 版本源码*
 
-*更新日期：2026-04-26 - 替换伪代码为 delegates 库真实实现分析*
+*更新日期：2026-04-26*
+- 替换伪代码为 delegates 库真实实现分析
+- 新增第 4 章：直接定义 vs 委托 - 设计边界分析
