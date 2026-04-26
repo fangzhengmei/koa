@@ -1045,9 +1045,654 @@ Koa 的错误处理机制是一个多层级、协作式的系统：
 
 这种机制使得 Koa 中间件可以轻松实现日志记录、错误处理、性能监控等功能，为 Web 应用开发提供了极大的灵活性和可维护性。
 
-## 10. 参考资料
+## 10. AsyncLocalStorage 上下文管理机制深度分析
+
+Koa 3.x 引入了 `AsyncLocalStorage`（ALS）来支持全局上下文访问，这是一个重要的功能增强。在多个请求并发进来的场景下，`AsyncLocalStorage` 能够保证每个请求的 `ctx` 不互串，为开发者提供了极大的便利。
+
+### 10.1 Koa 中 AsyncLocalStorage 的实现
+
+#### 10.1.1 核心代码分析
+
+在 `lib/application.js` 中，Koa 对 `AsyncLocalStorage` 的使用主要涉及以下几个部分：
+
+**1. 导入和辅助函数**：
+
+```javascript
+const { AsyncLocalStorage } = require('node:async_hooks')
+
+// ...
+
+function getAsyncLocalStorage (options) {
+  if (options.asyncLocalStorage instanceof AsyncLocalStorage) {
+    return options.asyncLocalStorage
+  }
+  return new AsyncLocalStorage()
+}
+```
+
+**2. 构造函数中的初始化**：
+
+```javascript
+constructor (options) {
+  // ...
+  if (options.asyncLocalStorage) {
+    if (v8.startupSnapshot?.isBuildingSnapshot?.()) {
+      this.ctxStorage = null
+      v8.startupSnapshot.addDeserializeCallback(({ app, options }) => {
+        app.ctxStorage = getAsyncLocalStorage(options)
+      }, { app: this, options })
+    } else {
+      this.ctxStorage = getAsyncLocalStorage(options)
+    }
+  }
+}
+```
+
+**3. 请求处理中的使用**：
+
+```javascript
+callback () {
+  const fn = this.compose(this.middleware)
+
+  if (!this.listenerCount('error')) this.on('error', this.onerror)
+
+  const handleRequest = (req, res) => {
+    const ctx = this.createContext(req, res)
+    if (!this.ctxStorage) {
+      return this.handleRequest(ctx, fn)
+    }
+    return this.ctxStorage.run(ctx, async () => {
+      return await this.handleRequest(ctx, fn)
+    })
+  }
+
+  return handleRequest
+}
+```
+
+**4. 全局上下文访问**：
+
+```javascript
+get currentContext () {
+  if (this.ctxStorage) return this.ctxStorage.getStore()
+}
+```
+
+#### 10.1.2 实现要点解析
+
+从上面的代码可以看出，Koa 中 `AsyncLocalStorage` 的实现有以下几个要点：
+
+1. **可选启用**：`AsyncLocalStorage` 是可选的，只有当 `options.asyncLocalStorage` 为 true 时才会启用
+2. **自定义实例支持**：用户可以传入自定义的 `AsyncLocalStorage` 实例，也可以让 Koa 创建一个新的
+3. **Snapshot 支持**：考虑到 Node.js 的启动快照（startup snapshot）功能，Koa 在快照构建时会延迟初始化 `ctxStorage`
+4. **上下文绑定**：在处理每个请求时，如果启用了 `ctxStorage`，则使用 `this.ctxStorage.run(ctx, callback)` 来绑定上下文
+5. **全局访问**：通过 `app.currentContext` getter 可以在任何地方获取当前请求的上下文
+
+### 10.2 AsyncLocalStorage 的工作原理
+
+#### 10.2.1 什么是 AsyncLocalStorage
+
+`AsyncLocalStorage` 是 Node.js 提供的异步资源跟踪 API，属于 `async_hooks` 模块的一部分。它能够在异步操作中维护和访问上下文数据，解决了 Node.js 异步编程中上下文传递的难题。
+
+简单来说，`AsyncLocalStorage` 类似于其他语言中的"线程局部存储"（Thread-Local Storage, TLS），但它是针对 Node.js 的异步执行模型设计的。
+
+#### 10.2.2 核心 API
+
+`AsyncLocalStorage` 提供了以下核心 API：
+
+1. **`run(store, callback)`**：
+   - 创建一个新的上下文作用域
+   - 在 `callback` 函数内部，以及由 `callback` 触发的任何后续异步操作中，都可以访问到 `store`
+   - 返回 `callback` 函数的返回值
+
+2. **`getStore()`**：
+   - 获取当前作用域的存储数据
+   - 如果在通过 `run()` 或 `enterWith()` 初始化的异步上下文之外调用，返回 `undefined`
+
+3. **`enterWith(store)`**：
+   - 显式进入某个上下文（不推荐使用，因为可能导致上下文泄漏）
+
+#### 10.2.3 工作原理
+
+Node.js 内部维护了一个异步调用栈，`AsyncLocalStorage` 通过以下机制工作：
+
+1. **上下文关联**：每个异步操作都会被分配一个唯一的异步 ID
+2. **存储传播**：当创建新的异步操作时，当前上下文会自动传播到新的异步操作
+3. **隔离性**：不同异步调用链之间的存储完全隔离
+
+这种机制确保了：
+- 即使代码经过多次异步调用、多次函数堆栈的弹出和压入
+- 只要它们都属于同一个"因果链"上的异步操作
+- 就都能访问到最初设置的那个 `store` 对象
+
+### 10.3 并发请求场景下的上下文隔离
+
+#### 10.3.1 传统上下文传递的问题
+
+在传统的 Koa 应用中，上下文必须显式传递：
+
+```javascript
+app.use(async (ctx, next) => {
+  // 必须手动传递 ctx
+  someFunction(ctx);
+  await next();
+});
+
+function someFunction(ctx) {
+  console.log(ctx.url);
+}
+```
+
+这种方式存在以下问题：
+
+1. **参数透传（Prop Drilling）**：需要把所有请求相关的上下文数据作为参数，显式地从一个函数传递到另一个函数，甚至跨越多个模块和层级
+2. **代码臃肿**：函数签名变得冗长，代码可读性差
+3. **重构困难**：当需要添加或修改上下文数据时，需要修改所有相关的函数签名
+4. **容易出错**：很容易遗漏或传递错误的参数
+
+而使用全局变量则更是灾难性的：
+
+```javascript
+// 这是错误的做法！
+let currentCtx;
+
+app.use(async (ctx, next) => {
+  currentCtx = ctx; // 设置全局变量
+  await next();
+});
+
+function someFunction() {
+  console.log(currentCtx.url); // 访问全局变量
+}
+```
+
+这种方式存在严重的竞态条件问题：
+- Node.js 是单线程的，所有请求共享同一个全局作用域
+- 如果请求 A 设置了 `currentCtx`，紧接着请求 B 又来了
+- 请求 B 可能会覆盖掉请求 A 的数据，导致数据混乱，甚至安全漏洞
+
+#### 10.3.2 AsyncLocalStorage 的解决方案
+
+`AsyncLocalStorage` 提供了一个优雅的解决方案。让我们通过一个具体的例子来理解它如何在并发请求场景下保证上下文隔离：
+
+```javascript
+const http = require('node:http');
+const { AsyncLocalStorage } = require('node:async_hooks');
+
+const asyncLocalStorage = new AsyncLocalStorage();
+
+function logWithId(msg) {
+  const id = asyncLocalStorage.getStore();
+  console.log(`${id !== undefined ? id : '-'}:`, msg);
+}
+
+let idSeq = 0;
+
+// 创建 HTTP 服务器
+http.createServer((req, res) => {
+  // 为每个请求创建一个独立的上下文
+  const requestId = idSeq++;
+  
+  // 使用 run() 方法绑定上下文
+  asyncLocalStorage.run(requestId, () => {
+    logWithId('start');
+    
+    // 模拟异步操作
+    setTimeout(() => {
+      logWithId('processing...');
+      
+      // 再嵌套一层异步操作
+      setImmediate(() => {
+        logWithId('finish');
+        res.end();
+      });
+    }, Math.random() * 100); // 随机延迟，模拟并发
+  });
+}).listen(8080);
+
+// 模拟并发请求
+http.get('http://localhost:8080');
+http.get('http://localhost:8080');
+http.get('http://localhost:8080');
+```
+
+**输出结果**：
+
+```
+0: start
+1: start
+2: start
+0: processing...
+1: processing...
+2: processing...
+0: finish
+1: finish
+2: finish
+```
+
+**关键点分析**：
+
+1. **上下文绑定**：每个请求在 `asyncLocalStorage.run(requestId, callback)` 中执行
+2. **隔离性**：即使请求 0、1、2 的处理过程交错进行（因为有随机延迟）
+3. **正确性**：每个请求的 `logWithId` 调用都能获取到正确的 `requestId`
+4. **传播性**：即使在 `setTimeout` 和 `setImmediate` 等异步操作中，上下文仍然保持正确
+
+#### 10.3.3 Koa 中的并发请求处理
+
+现在让我们看看 Koa 是如何利用 `AsyncLocalStorage` 来处理并发请求的：
+
+```javascript
+// 伪代码，模拟 Koa 的请求处理流程
+
+const { AsyncLocalStorage } = require('node:async_hooks');
+
+class Koa {
+  constructor(options) {
+    this.middleware = [];
+    if (options?.asyncLocalStorage) {
+      this.ctxStorage = new AsyncLocalStorage();
+    }
+  }
+
+  use(fn) {
+    this.middleware.push(fn);
+    return this;
+  }
+
+  callback() {
+    const fn = compose(this.middleware);
+
+    const handleRequest = (req, res) => {
+      const ctx = this.createContext(req, res);
+      
+      if (!this.ctxStorage) {
+        // 没有启用 AsyncLocalStorage，直接处理
+        return this.handleRequest(ctx, fn);
+      }
+      
+      // 启用了 AsyncLocalStorage，使用 run() 绑定上下文
+      return this.ctxStorage.run(ctx, async () => {
+        // 在这个回调函数内部，以及它触发的所有异步操作中
+        // this.ctxStorage.getStore() 都会返回当前的 ctx
+        return await this.handleRequest(ctx, fn);
+      });
+    }
+
+    return handleRequest;
+  }
+
+  get currentContext() {
+    if (this.ctxStorage) {
+      // 获取当前上下文
+      return this.ctxStorage.getStore();
+    }
+  }
+
+  // ... 其他方法
+}
+```
+
+**并发场景下的执行流程**：
+
+假设同时有 3 个请求（请求 A、B、C）到达服务器：
+
+1. **请求 A 到达**：
+   - 创建 `ctx_A`
+   - 调用 `this.ctxStorage.run(ctx_A, callback_A)`
+   - 在 `callback_A` 内部，`this.ctxStorage.getStore()` 返回 `ctx_A`
+   - 中间件链开始执行，可能包含多个异步操作
+   - 当遇到 `await` 时，请求 A 暂停，让出 CPU
+
+2. **请求 B 到达**：
+   - 创建 `ctx_B`
+   - 调用 `this.ctxStorage.run(ctx_B, callback_B)`
+   - 在 `callback_B` 内部，`this.ctxStorage.getStore()` 返回 `ctx_B`
+   - 中间件链开始执行，可能包含多个异步操作
+   - 当遇到 `await` 时，请求 B 暂停，让出 CPU
+
+3. **请求 C 到达**：
+   - 创建 `ctx_C`
+   - 调用 `this.ctxStorage.run(ctx_C, callback_C)`
+   - 在 `callback_C` 内部，`this.ctxStorage.getStore()` 返回 `ctx_C`
+   - 中间件链开始执行，可能包含多个异步操作
+   - 当遇到 `await` 时，请求 C 暂停，让出 CPU
+
+4. **异步操作完成**：
+   - 假设请求 A 的某个异步操作完成
+   - 回调函数被添加到事件队列
+   - 当事件循环处理这个回调时
+   - `this.ctxStorage.getStore()` 仍然返回 `ctx_A`！
+   - 这是因为 `AsyncLocalStorage` 会跟踪异步操作的因果链
+
+**关键点**：
+- 每个请求都有自己独立的异步上下文
+- 即使多个请求的处理过程交错进行
+- 每个请求的 `ctx` 都不会互相干扰
+- 在任何异步操作的回调中，都能获取到正确的 `ctx`
+
+### 10.4 Koa 中 AsyncLocalStorage 的使用场景
+
+#### 10.4.1 全局上下文访问
+
+启用 `AsyncLocalStorage` 后，开发者可以在任何地方获取当前请求的上下文：
+
+```javascript
+const Koa = require('koa');
+const app = new Koa({ asyncLocalStorage: true });
+
+// 中间件
+app.use(async (ctx, next) => {
+  ctx.state.user = { id: 123, name: 'John' };
+  await next();
+});
+
+app.use(async (ctx, next) => {
+  // 不需要传递 ctx，可以直接调用服务层函数
+  const result = userService.getCurrentUserInfo();
+  ctx.body = result;
+});
+
+// 服务层（不需要接收 ctx 参数）
+const userService = {
+  getCurrentUserInfo() {
+    // 直接获取当前上下文
+    const ctx = app.currentContext;
+    if (!ctx) {
+      throw new Error('No active request context');
+    }
+    
+    // 使用上下文中的数据
+    const user = ctx.state.user;
+    return {
+      id: user.id,
+      name: user.name,
+      timestamp: Date.now()
+    };
+  }
+};
+
+app.listen(3000);
+```
+
+**优势**：
+- 服务层函数不需要接收 `ctx` 参数
+- 代码更加简洁，不需要层层传递上下文
+- 深层代码也能轻松访问请求上下文
+
+#### 10.4.2 请求追踪
+
+`AsyncLocalStorage` 非常适合用于请求追踪：
+
+```javascript
+const Koa = require('koa');
+const app = new Koa({ asyncLocalStorage: true });
+const { v4: uuidv4 } = require('uuid');
+
+// 请求 ID 中间件
+app.use(async (ctx, next) => {
+  // 为每个请求生成唯一 ID
+  ctx.state.requestId = uuidv4();
+  await next();
+});
+
+// 日志中间件
+app.use(async (ctx, next) => {
+  const start = Date.now();
+  logger.info('Request started');
+  try {
+    await next();
+  } finally {
+    const ms = Date.now() - start;
+    logger.info(`Request completed in ${ms}ms`);
+  }
+});
+
+// 自定义日志函数
+function logger(msg) {
+  // 获取当前请求的 ID
+  const ctx = app.currentContext;
+  const requestId = ctx?.state?.requestId || 'N/A';
+  
+  // 日志中包含请求 ID
+  console.log(`[${new Date().toISOString()}] [${requestId}] ${msg}`);
+}
+
+// 业务中间件
+app.use(async (ctx) => {
+  logger('Processing business logic');
+  
+  // 调用服务层
+  const result = businessService.process(ctx.query);
+  
+  ctx.body = result;
+});
+
+// 服务层
+const businessService = {
+  process(query) {
+    logger('In businessService.process');
+    
+    // 调用数据访问层
+    return dataAccess.query(query);
+  }
+};
+
+// 数据访问层
+const dataAccess = {
+  query(query) {
+    logger('In dataAccess.query');
+    
+    // 模拟数据库查询
+    return { data: 'result' };
+  }
+};
+
+app.listen(3000);
+```
+
+**输出示例**：
+
+```
+[2026-04-26T10:30:00.000Z] [550e8400-e29b-41d4-a716-446655440000] Request started
+[2026-04-26T10:30:00.001Z] [550e8400-e29b-41d4-a716-446655440000] Processing business logic
+[2026-04-26T10:30:00.002Z] [550e8400-e29b-41d4-a716-446655440000] In businessService.process
+[2026-04-26T10:30:00.003Z] [550e8400-e29b-41d4-a716-446655440000] In dataAccess.query
+[2026-04-26T10:30:00.004Z] [550e8400-e29b-41d4-a716-446655440000] Request completed in 4ms
+```
+
+**优势**：
+- 所有日志都自动包含请求 ID
+- 即使在深层的服务层和数据访问层，也能获取到请求 ID
+- 不需要在每个函数调用中传递请求 ID
+- 可以轻松追踪单个请求的完整执行路径
+
+#### 10.4.3 多租户隔离
+
+在多租户系统中，`AsyncLocalStorage` 可以用于隔离不同租户的数据：
+
+```javascript
+const Koa = require('koa');
+const app = new Koa({ asyncLocalStorage: true });
+
+// 租户中间件
+app.use(async (ctx, next) => {
+  // 从请求头或域名中获取租户 ID
+  const tenantId = ctx.headers['x-tenant-id'] || ctx.hostname.split('.')[0];
+  
+  // 验证租户 ID
+  if (!isValidTenant(tenantId)) {
+    ctx.status = 400;
+    ctx.body = { error: 'Invalid tenant ID' };
+    return;
+  }
+  
+  // 存储租户信息到上下文
+  ctx.state.tenant = {
+    id: tenantId,
+    config: getTenantConfig(tenantId)
+  };
+  
+  await next();
+});
+
+// 数据库服务
+const dbService = {
+  async query(sql) {
+    // 获取当前租户
+    const ctx = app.currentContext;
+    if (!ctx?.state?.tenant) {
+      throw new Error('No tenant context available');
+    }
+    
+    const tenant = ctx.state.tenant;
+    
+    // 使用租户特定的数据库连接或配置
+    const connection = getTenantConnection(tenant.id);
+    
+    // 执行查询
+    return connection.query(sql);
+  }
+};
+
+// 业务中间件
+app.use(async (ctx) => {
+  // 不需要传递租户信息，dbService 会自动获取
+  const users = await dbService.query('SELECT * FROM users');
+  
+  ctx.body = {
+    tenant: ctx.state.tenant.id,
+    users
+  };
+});
+
+app.listen(3000);
+```
+
+**优势**：
+- 业务代码不需要关心租户隔离的细节
+- 数据库服务层自动获取当前租户
+- 确保不会出现跨租户的数据访问
+- 代码更加简洁和安全
+
+### 10.5 AsyncLocalStorage 的最佳实践
+
+#### 10.5.1 何时使用 AsyncLocalStorage
+
+**推荐使用的场景**：
+1. **请求追踪**：需要在整个请求生命周期中追踪请求 ID
+2. **日志记录**：需要在日志中自动包含请求上下文信息
+3. **多租户系统**：需要隔离不同租户的数据和配置
+4. **全局上下文访问**：深层代码需要访问请求上下文，但不想层层传递参数
+5. **事务管理**：需要在整个请求中维护数据库事务上下文
+
+**不推荐使用的场景**：
+1. **简单应用**：应用结构简单，上下文传递成本低
+2. **性能敏感**：虽然 `AsyncLocalStorage` 已经过优化，但仍有轻微的性能开销
+3. **短期上下文**：上下文只在少数几个函数中使用，直接传递更清晰
+
+#### 10.5.2 使用注意事项
+
+1. **空值检查**：
+   - `app.currentContext` 可能返回 `undefined`（在请求上下文之外）
+   - 始终检查返回值，避免空指针错误
+
+   ```javascript
+   function getCurrentUser() {
+     const ctx = app.currentContext;
+     if (!ctx) {
+       throw new Error('No active request context');
+     }
+     return ctx.state.user;
+   }
+   ```
+
+2. **异步边界**：
+   - `AsyncLocalStorage` 能够自动跟踪大多数异步操作
+   - 但对于某些特殊的异步模式（如手动创建的 Worker Threads），可能需要显式绑定上下文
+
+3. **内存管理**：
+   - `AsyncLocalStorage` 中的存储数据会在异步上下文结束后自动释放
+   - 但不要在存储中放置过大的对象，以免影响垃圾回收
+
+4. **错误处理**：
+   - 在 `AsyncLocalStorage.run()` 的回调中抛出的错误会正常传播
+   - 确保有适当的错误处理机制
+
+#### 10.5.3 性能考虑
+
+虽然 `AsyncLocalStorage` 是一个高性能的实现，但仍然有一些性能考虑：
+
+1. **轻微开销**：
+   - 每次 `run()` 调用都有轻微的性能开销
+   - 但这个开销通常可以忽略不计，特别是在 I/O 密集型的 Web 应用中
+
+2. **启用策略**：
+   - 只在需要时启用 `AsyncLocalStorage`
+   - Koa 设计为可选启用，就是为了让不需要的应用避免这个开销
+
+3. **优化建议**：
+   - 不要在 `run()` 回调中创建不必要的嵌套
+   - 避免频繁地进入和退出上下文
+   - 合理组织代码，减少上下文切换
+
+### 10.6 AsyncLocalStorage 与传统方式的对比
+
+让我们通过一个表格来对比 `AsyncLocalStorage` 与传统上下文传递方式的优缺点：
+
+| 特性 | AsyncLocalStorage | 参数透传 | 全局变量 |
+|------|-------------------|----------|----------|
+| **上下文隔离** | ✅ 完美隔离 | ✅ 天然隔离 | ❌ 竞态条件 |
+| **代码简洁性** | ✅ 简洁，无需传递 | ❌ 冗长，层层传递 | ✅ 简洁 |
+| **可维护性** | ✅ 高，修改不影响签名 | ❌ 低，修改需要更新所有调用 | ⚠️ 中等，但风险高 |
+| **性能开销** | ⚠️ 轻微 | ✅ 无额外开销 | ✅ 无额外开销 |
+| **类型安全** | ⚠️ 需要运行时检查 | ✅ 编译时检查 | ❌ 无类型安全 |
+| **适用场景** | 请求追踪、日志、多租户 | 简单应用、小型项目 | ❌ 不推荐使用 |
+| **调试难度** | ⚠️ 中等，需要理解异步上下文 | ✅ 简单，参数明确 | ❌ 困难，竞态条件难以调试 |
+
+### 10.7 总结
+
+`AsyncLocalStorage` 是 Node.js 提供的一个强大的异步上下文追踪工具，Koa 3.x 利用它实现了全局上下文访问功能。
+
+**核心要点**：
+
+1. **工作原理**：
+   - 每个 `AsyncLocalStorage` 实例维护一个独立的存储上下文
+   - 使用 `run(store, callback)` 方法创建新的上下文作用域
+   - 在 `callback` 内部及其触发的任何异步操作中，都可以通过 `getStore()` 获取到 `store`
+   - 不同异步调用链之间的存储完全隔离
+
+2. **Koa 中的实现**：
+   - 可选启用：只有当 `options.asyncLocalStorage` 为 true 时才会启用
+   - 上下文绑定：在处理每个请求时，使用 `this.ctxStorage.run(ctx, callback)` 来绑定上下文
+   - 全局访问：通过 `app.currentContext` getter 可以在任何地方获取当前请求的上下文
+
+3. **并发隔离保证**：
+   - 每个请求都有自己独立的异步上下文
+   - 即使多个请求的处理过程交错进行
+   - 每个请求的 `ctx` 都不会互相干扰
+   - 在任何异步操作的回调中，都能获取到正确的 `ctx`
+
+4. **使用场景**：
+   - 请求追踪
+   - 日志记录
+   - 多租户隔离
+   - 全局上下文访问
+   - 事务管理
+
+5. **最佳实践**：
+   - 只在需要时启用
+   - 始终检查 `app.currentContext` 的返回值
+   - 不要在存储中放置过大的对象
+   - 确保有适当的错误处理机制
+
+`AsyncLocalStorage` 为 Koa 开发者提供了一种优雅的方式来处理请求上下文，特别是在复杂的多层级应用中。它解决了传统参数透传的痛点，同时避免了全局变量的竞态条件问题，是现代 Node.js Web 开发中的一个重要工具。
+
+## 11. 参考资料
 
 - [Koa 官方文档](https://koajs.com/)
 - [koa-compose 源码](https://github.com/koajs/compose)
 - [Koa 源码解析](https://github.com/koajs/koa)
 - [Koa 错误处理最佳实践](https://github.com/koajs/koa/blob/master/docs/error-handling.md)
+- [Node.js AsyncLocalStorage 官方文档](https://nodejs.org/api/async_context.html#class-asynclocalstorage)
+- [Node.js 异步上下文追踪](https://nodejs.org/api/async_context.html)
+- [AsyncLocalStorage 与 Koa3.0 上下文管理机制](https://juejin.cn/post/7498635253557690404)
